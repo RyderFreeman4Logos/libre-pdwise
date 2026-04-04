@@ -12,3 +12,6 @@ thiserror.workspace = true
 tracing.workspace = true
 
 lpdwise-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
