@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig (Linux cross-compilation)
+        if: runner.os == 'Linux'
+        run: pip install ziglang
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
+
+      - name: Build release binary
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          BINARY_NAME="lpdwise"
+          TARGET="${{ matrix.target }}"
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          # Locate the built binary
+          BIN_PATH="target/${TARGET}/release/${BINARY_NAME}"
+          if [ ! -f "$BIN_PATH" ]; then
+            echo "Binary not found at $BIN_PATH"
+            exit 1
+          fi
+
+          ARCHIVE_NAME="${BINARY_NAME}-${TARGET}.tar.gz"
+          tar czf "${ARCHIVE_NAME}" -C "target/${TARGET}/release" "${BINARY_NAME}"
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lpdwise-${{ matrix.target }}
+          path: ${{ env.ARCHIVE_NAME }}
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE_NAME }}
