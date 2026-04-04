@@ -15,11 +15,17 @@ pub enum AsrError {
     #[error("api request failed: {0}")]
     ApiRequest(String),
 
+    #[error("api quota exceeded: {0}")]
+    QuotaExceeded(String),
+
     #[error("model loading failed: {0}")]
     ModelLoad(String),
 
     #[error("decoding failed: {0}")]
     Decode(String),
+
+    #[error("engine not available: {0}")]
+    NotAvailable(String),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

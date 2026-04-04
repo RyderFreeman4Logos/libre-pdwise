@@ -5,5 +5,5 @@ pub mod groq;
 pub mod sherpa;
 
 pub use engine::{AsrEngine, AsrError};
-pub use groq::GroqWhisperEngine;
+pub use groq::{transcribe_chunks, GroqWhisperEngine};
 pub use sherpa::SherpaOnnxEngine;
