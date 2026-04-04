@@ -48,6 +48,9 @@ toml = "0.8"
 # Time
 time = { version = "0.3", features = ["formatting", "macros"] }
 
+# Regex
+regex = "1"
+
 # Platform / FFI
 libc = "0.2"
 

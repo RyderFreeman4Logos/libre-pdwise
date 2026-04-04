@@ -17,6 +17,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 
 lpdwise-core.workspace = true
 lpdwise-process.workspace = true
@@ -25,3 +26,6 @@ lpdwise-asr.workspace = true
 lpdwise-clipboard.workspace = true
 lpdwise-archive.workspace = true
 lpdwise-device.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

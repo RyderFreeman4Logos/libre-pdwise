@@ -16,6 +16,7 @@ pub struct MediaAsset {
     pub source: InputSource,
     pub path: PathBuf,
     pub duration: Option<Duration>,
+    pub size_bytes: Option<u64>,
 }
 
 /// A chunk of audio extracted from a larger media asset.
