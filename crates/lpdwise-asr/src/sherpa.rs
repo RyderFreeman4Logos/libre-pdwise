@@ -9,6 +9,9 @@ use crate::engine::{AsrEngine, AsrError};
 
 const SHERPA_CLI: &str = "sherpa-onnx-offline";
 
+/// Default HuggingFace model identifier for sherpa-onnx transducer.
+const DEFAULT_MODEL_NAME: &str = "csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20";
+
 /// ASR engine backed by sherpa-onnx for local on-device inference.
 ///
 /// Uses the sherpa-onnx CLI as a subprocess. If the CLI binary is not
@@ -24,6 +27,24 @@ impl SherpaOnnxEngine {
             model_dir,
             runner: CommandRunner::new(Duration::from_secs(10 * 60)),
         }
+    }
+
+    /// Ensure model files exist in `model_dir`, downloading if necessary.
+    async fn ensure_model(&self) -> Result<(), AsrError> {
+        if self.find_model_files().is_ok() {
+            return Ok(());
+        }
+
+        debug!(model_dir = %self.model_dir.display(), "model files not found, downloading");
+
+        crate::model::download_model(DEFAULT_MODEL_NAME, &self.model_dir, None)
+            .await
+            .map_err(|e| AsrError::ModelLoad(format!(
+                "failed to download model to {}: {e}",
+                self.model_dir.display()
+            )))?;
+
+        Ok(())
     }
 
     /// Check if the sherpa-onnx CLI is available on PATH.
@@ -114,6 +135,7 @@ impl AsrEngine for SherpaOnnxEngine {
         chunk: &AudioChunk,
     ) -> Result<Vec<TranscriptSegment>, AsrError> {
         self.check_cli_available().await?;
+        self.ensure_model().await?;
 
         let model_files = self.find_model_files()?;
 

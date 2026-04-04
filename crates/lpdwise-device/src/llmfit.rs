@@ -126,7 +126,7 @@ fn probe_disk_free() -> u64 {
         if ret == 0 {
             // SAFETY: statvfs returned 0 (success), so the buffer is initialized.
             let stat = unsafe { stat.assume_init() };
-            return stat.f_bavail * stat.f_frsize;
+            return stat.f_bavail.saturating_mul(stat.f_frsize);
         }
     }
     0

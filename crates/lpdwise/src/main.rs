@@ -44,7 +44,12 @@ async fn main() -> Result<(), AppError> {
 /// Main extraction pipeline orchestration.
 async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
     // -- Load config --
-    let config = lpdwise_core::load_config().context("failed to load config")?;
+    let mut config = lpdwise_core::load_config().context("failed to load config")?;
+
+    // CLI --model-dir overrides config
+    if let Some(ref model_dir) = cli.model_dir {
+        config.models_dir = model_dir.clone();
+    }
 
     // -- Resolve input --
     let source = input::resolve_input(cli.input.as_deref())

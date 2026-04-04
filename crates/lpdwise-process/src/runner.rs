@@ -121,7 +121,7 @@ impl ProcessRunner for CommandRunner {
         cmd.stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
-        let pid = child.id().unwrap_or(0);
+        let pid = child.id().ok_or(ProcessError::NoPid)?;
 
         // Take stdout/stderr handles before waiting so we can still access
         // the child for cleanup on timeout.
@@ -129,23 +129,36 @@ impl ProcessRunner for CommandRunner {
         let child_stderr = child.stderr.take();
 
         let collect_and_wait = async {
-            let mut stdout_buf = Vec::new();
-            let mut stderr_buf = Vec::new();
+            // Read stdout and stderr concurrently to prevent pipe deadlock.
+            // Sequential reads can deadlock if the child writes >64KB to stderr
+            // while stdout reading is still in progress (or vice versa).
+            let stdout_fut = async {
+                let mut buf = Vec::new();
+                if let Some(out) = child_stdout {
+                    tokio::io::AsyncReadExt::read_to_end(
+                        &mut tokio::io::BufReader::new(out),
+                        &mut buf,
+                    )
+                    .await?;
+                }
+                Ok::<_, std::io::Error>(buf)
+            };
 
-            if let Some(out) = child_stdout {
-                tokio::io::AsyncReadExt::read_to_end(
-                    &mut tokio::io::BufReader::new(out),
-                    &mut stdout_buf,
-                )
-                .await?;
-            }
-            if let Some(err) = child_stderr {
-                tokio::io::AsyncReadExt::read_to_end(
-                    &mut tokio::io::BufReader::new(err),
-                    &mut stderr_buf,
-                )
-                .await?;
-            }
+            let stderr_fut = async {
+                let mut buf = Vec::new();
+                if let Some(err) = child_stderr {
+                    tokio::io::AsyncReadExt::read_to_end(
+                        &mut tokio::io::BufReader::new(err),
+                        &mut buf,
+                    )
+                    .await?;
+                }
+                Ok::<_, std::io::Error>(buf)
+            };
+
+            let (stdout_result, stderr_result) = tokio::join!(stdout_fut, stderr_fut);
+            let stdout_buf = stdout_result?;
+            let stderr_buf = stderr_result?;
 
             let status = child.wait().await?;
             Ok::<_, std::io::Error>((status, stdout_buf, stderr_buf))
@@ -195,7 +208,7 @@ impl ProcessRunner for CommandRunner {
         cmd.stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
-        let pid = child.id().unwrap_or(0);
+        let pid = child.id().ok_or(ProcessError::NoPid)?;
 
         let child_stdout = child.stdout.take();
         let child_stderr = child.stderr.take();
@@ -316,6 +329,9 @@ pub enum ProcessError {
         status: ExitStatus,
         output: ProcessOutput,
     },
+
+    #[error("failed to obtain child process ID")]
+    NoPid,
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
