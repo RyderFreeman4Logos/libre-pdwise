@@ -1,0 +1,36 @@
+[package]
+name = "lpdwise"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "lpdwise"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+inquire.workspace = true
+indicatif.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+lpdwise-core.workspace = true
+lpdwise-process.workspace = true
+lpdwise-audio.workspace = true
+lpdwise-asr.workspace = true
+lpdwise-clipboard.workspace = true
+lpdwise-archive.workspace = true
+lpdwise-device.workspace = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/lpdwise-{ target }{ archive-suffix }"
+bin-dir = "lpdwise{ binary-ext }"
+pkg-fmt = "tgz"
+
+[dev-dependencies]
+tempfile.workspace = true

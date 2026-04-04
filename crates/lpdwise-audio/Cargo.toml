@@ -1,0 +1,22 @@
+[package]
+name = "lpdwise-audio"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+
+lpdwise-core.workspace = true
+lpdwise-process.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
