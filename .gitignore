@@ -1,0 +1,22 @@
+/target/
+/.cargo-local/
+
+# Editor swap files
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+
+# Workspace lock file (not committed for workspaces)
+Cargo.lock
+
+# Weave lock file
+weave.lock
+
+# Test artifacts
+test_write
