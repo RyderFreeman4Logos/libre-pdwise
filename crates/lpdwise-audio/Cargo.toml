@@ -15,3 +15,7 @@ regex.workspace = true
 
 lpdwise-core.workspace = true
 lpdwise-process.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["full", "test-util"] }
