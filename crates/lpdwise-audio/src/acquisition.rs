@@ -185,8 +185,9 @@ fn find_output_file(base_path: &Path) -> Result<PathBuf, AcquisitionError> {
     }
 
     // yt-dlp commonly appends the audio format extension
+    let base_str = base_path.to_string_lossy();
     for ext in &["opus", "m4a", "mp3", "wav", "webm"] {
-        let candidate = base_path.with_extension(ext);
+        let candidate = PathBuf::from(format!("{base_str}.{ext}"));
         if candidate.exists() {
             return Ok(candidate);
         }
