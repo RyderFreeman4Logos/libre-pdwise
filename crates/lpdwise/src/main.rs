@@ -64,8 +64,9 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
     };
 
     // -- Engine selection --
-    let device = lpdwise_device::LlmfitProber
-        .probe()
+    let device = tokio::task::spawn_blocking(|| lpdwise_device::LlmfitProber.probe())
+        .await
+        .context("device detection task failed")?
         .context("device detection failed")?;
 
     let groq_available = config.groq_api_key.is_some();

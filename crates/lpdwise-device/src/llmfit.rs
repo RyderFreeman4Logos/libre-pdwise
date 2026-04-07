@@ -210,20 +210,18 @@ fn resolve_mise_binary(tool: &str) -> Result<PathBuf, String> {
 }
 
 fn install_with_mise(spec: &str) -> Result<(), String> {
-    let output = std::process::Command::new("mise")
+    let status = std::process::Command::new("mise")
         .args(["use", "-g", spec])
-        .output()
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
         .map_err(|e| format!("failed to spawn `mise use -g {spec}`: {e}"))?;
 
-    if output.status.success() {
+    if status.success() {
         return Ok(());
     }
 
-    Err(format!(
-        "`mise use -g {spec}` exited with {}{}",
-        output.status,
-        format_command_context(&output.stdout, &output.stderr)
-    ))
+    Err(format!("`mise use -g {spec}` exited with {status}"))
 }
 
 fn format_command_context(stdout: &[u8], stderr: &[u8]) -> String {

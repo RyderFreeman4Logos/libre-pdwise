@@ -73,12 +73,14 @@ impl SherpaOnnxEngine {
         }
 
         debug!("sherpa-onnx unavailable, attempting to install/activate via mise use -g...");
-        match self
-            .runner
-            .run_checked("mise", &["use", "-g", SHERPA_MISE_SPEC])
+        match tokio::process::Command::new("mise")
+            .args(["use", "-g", SHERPA_MISE_SPEC])
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
             .await
         {
-            Ok(_) => {
+            Ok(status) if status.success() => {
                 if let Some(path) = self.resolve_mise_binary().await {
                     match self.probe_cli_candidate(path.as_str()).await {
                         Ok(()) => return Ok(path),
@@ -90,7 +92,12 @@ impl SherpaOnnxEngine {
                     "`mise use -g {SHERPA_MISE_SPEC}` succeeded but no healthy active {SHERPA_CLI} binary was resolved"
                 ));
             }
-            Err(e) => failures.push(format!("`mise use -g {SHERPA_MISE_SPEC}` failed: {e}")),
+            Ok(status) => failures.push(format!(
+                "`mise use -g {SHERPA_MISE_SPEC}` exited with {status}"
+            )),
+            Err(e) => failures.push(format!(
+                "failed to spawn `mise use -g {SHERPA_MISE_SPEC}`: {e}"
+            )),
         }
 
         Err(AsrError::NotAvailable(format!(
