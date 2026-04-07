@@ -34,8 +34,8 @@ impl ClipboardProvider for TermuxClipboard {
         // Write content via stdin pipe instead of command-line argument to
         // prevent sensitive data from appearing in process listings.
         //
-        // The write is done in a dedicated thread to avoid blocking the tokio
-        // worker thread on large content that exceeds the OS pipe buffer.
+        // The write is done in a dedicated thread to avoid blocking the caller
+        // thread on large content that exceeds the OS pipe buffer.
         let content = content.to_owned();
         std::thread::scope(|s| {
             let mut child = Command::new("termux-clipboard-set")
@@ -52,7 +52,10 @@ impl ClipboardProvider for TermuxClipboard {
 
             let output = child.wait_with_output()?;
 
-            write_handle.join().expect("stdin writer thread panicked")?;
+            let write_result = write_handle.join().map_err(|_| {
+                ClipboardError::Unavailable("stdin writer thread panicked".to_string())
+            })?;
+            write_result?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);

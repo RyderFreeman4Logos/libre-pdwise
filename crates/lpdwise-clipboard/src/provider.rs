@@ -25,23 +25,25 @@ pub enum ClipboardError {
 
 /// Detect the best clipboard provider for the current environment.
 ///
-/// Priority: Termux → Desktop (arboard) → stdout fallback.
+/// Priority: Termux → Desktop (arboard) → stdin/stdout fallback.
 pub fn auto_detect() -> Box<dyn ClipboardProvider> {
+    #[cfg(feature = "termux")]
     if std::env::var("TERMUX_VERSION").is_ok() {
         tracing::debug!("detected Termux environment, using TermuxClipboard");
         return Box::new(crate::TermuxClipboard::new());
     }
 
-    if std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() {
-        tracing::debug!("detected display server, trying arboard");
+    #[cfg(feature = "desktop")]
+    {
+        tracing::debug!("trying arboard clipboard provider");
         match crate::ArboardClipboard::new() {
             Ok(clipboard) => return Box::new(clipboard),
             Err(e) => {
-                tracing::warn!("arboard init failed: {e}, falling back to stdout");
+                tracing::warn!("arboard init failed: {e}, falling back to stdin/stdout");
             }
         }
     }
 
-    tracing::debug!("no clipboard backend available, using stdout fallback");
-    Box::new(crate::StdoutFallback::new())
+    tracing::debug!("no clipboard backend available, using stdin/stdout fallback");
+    Box::new(crate::StdinProvider::new())
 }

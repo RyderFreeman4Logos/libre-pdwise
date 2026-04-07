@@ -76,6 +76,6 @@ lpdwise-core = { path = "crates/lpdwise-core" }
 lpdwise-process = { path = "crates/lpdwise-process" }
 lpdwise-audio = { path = "crates/lpdwise-audio" }
 lpdwise-asr = { path = "crates/lpdwise-asr" }
-lpdwise-clipboard = { path = "crates/lpdwise-clipboard" }
+lpdwise-clipboard = { path = "crates/lpdwise-clipboard", default-features = false }
 lpdwise-archive = { path = "crates/lpdwise-archive" }
 lpdwise-device = { path = "crates/lpdwise-device" }

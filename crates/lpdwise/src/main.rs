@@ -203,7 +203,7 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
         eprintln!("归档完成: {}", config.archive_dir.display());
     }
 
-    eprintln!("\nPrompt 已复制到剪贴板，请粘贴到 LLM 对话窗口。");
+    eprintln!("\nPrompt 已发送到可用的剪贴板后端；若无系统剪贴板，则已输出到标准输出。");
     Ok(())
 }
 
