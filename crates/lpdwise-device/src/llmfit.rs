@@ -1,6 +1,6 @@
-use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::time::Duration;
 
+use lpdwise_process::{CommandRunner, ProcessError};
 use serde::Deserialize;
 use sysinfo::System;
 use tracing::{debug, warn};
@@ -9,6 +9,9 @@ use crate::probe::{Acceleration, DeviceCapabilities, DeviceProber, ProbeError};
 
 const LLMFIT_CLI: &str = "llmfit";
 const LLMFIT_INSTALL_SPEC: &str = "cargo:llmfit@latest";
+const LLMFIT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const LLMFIT_MISE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+const LLMFIT_MISE_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Device prober that tries `llmfit system --json` first, then falls back
 /// to sysinfo for basic capability detection.
@@ -52,23 +55,26 @@ impl LlmfitProber {
     /// Try probing via `llmfit system --json` CLI.
     fn try_llmfit(&self) -> Option<DeviceCapabilities> {
         let mut failures = Vec::new();
+        let probe_runner = CommandRunner::new(LLMFIT_PROBE_TIMEOUT);
+        let resolve_runner = CommandRunner::new(LLMFIT_MISE_RESOLVE_TIMEOUT);
+        let install_runner = CommandRunner::new(LLMFIT_MISE_INSTALL_TIMEOUT);
 
-        if let Ok(path) = resolve_mise_binary(LLMFIT_CLI) {
-            match run_llmfit_command(path.as_os_str()) {
+        if let Ok(path) = resolve_mise_binary(LLMFIT_CLI, &resolve_runner) {
+            match run_llmfit_command(path.as_str(), &probe_runner) {
                 Ok(caps) => return Some(caps),
                 Err(reason) => failures.push(format!("mise-managed {LLMFIT_CLI}: {reason}")),
             }
         }
 
-        match run_llmfit_command(OsStr::new(LLMFIT_CLI)) {
+        match run_llmfit_command(LLMFIT_CLI, &probe_runner) {
             Ok(caps) => return Some(caps),
             Err(reason) => failures.push(format!("PATH {LLMFIT_CLI}: {reason}")),
         }
 
         debug!("llmfit unavailable, attempting to install/activate via mise use -g...");
-        match install_with_mise(LLMFIT_INSTALL_SPEC) {
-            Ok(()) => match resolve_mise_binary(LLMFIT_CLI) {
-                Ok(path) => match run_llmfit_command(path.as_os_str()) {
+        match install_with_mise(LLMFIT_INSTALL_SPEC, &install_runner) {
+            Ok(()) => match resolve_mise_binary(LLMFIT_CLI, &resolve_runner) {
+                Ok(path) => match run_llmfit_command(path.as_str(), &probe_runner) {
                     Ok(caps) => return Some(caps),
                     Err(reason) => {
                         failures.push(format!("mise-managed {LLMFIT_CLI} after install: {reason}"))
@@ -170,63 +176,35 @@ fn gigabytes_to_mb(value: f64) -> u64 {
     (value * 1024.0).round().max(0.0) as u64
 }
 
-fn run_llmfit_command(program: &OsStr) -> Result<DeviceCapabilities, String> {
-    let output = std::process::Command::new(program)
-        .args(["system", "--json"])
-        .output()
-        .map_err(|e| format!("failed to spawn llmfit system --json: {e}"))?;
+fn run_llmfit_command(program: &str, runner: &CommandRunner) -> Result<DeviceCapabilities, String> {
+    let output = runner
+        .run_checked_blocking(program, &["system", "--json"])
+        .map_err(|err| format_process_failure("llmfit system --json", err))?;
 
-    if !output.status.success() {
-        return Err(format!(
-            "llmfit system --json exited with {}{}",
-            output.status,
-            format_command_context(&output.stdout, &output.stderr)
-        ));
-    }
-
-    LlmfitProber::parse_llmfit_output(&output.stdout)
+    LlmfitProber::parse_llmfit_output(output.stdout.as_bytes())
 }
 
-fn resolve_mise_binary(tool: &str) -> Result<PathBuf, String> {
-    let output = std::process::Command::new("mise")
-        .args(["which", tool])
-        .output()
-        .map_err(|e| format!("failed to spawn `mise which {tool}`: {e}"))?;
+fn resolve_mise_binary(tool: &str, runner: &CommandRunner) -> Result<String, String> {
+    let output = runner
+        .run_checked_blocking("mise", &["which", tool])
+        .map_err(|err| format_process_failure(&format!("`mise which {tool}`"), err))?;
 
-    if !output.status.success() {
-        return Err(format!(
-            "`mise which {tool}` exited with {}{}",
-            output.status,
-            format_command_context(&output.stdout, &output.stderr)
-        ));
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let path = output.stdout.trim().to_string();
     if path.is_empty() {
         return Err(format!("`mise which {tool}` returned an empty path"));
     }
 
-    Ok(PathBuf::from(path))
+    Ok(path)
 }
 
-fn install_with_mise(spec: &str) -> Result<(), String> {
-    let status = std::process::Command::new("mise")
-        .args(["use", "-g", spec])
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| format!("failed to spawn `mise use -g {spec}`: {e}"))?;
-
-    if status.success() {
-        return Ok(());
-    }
-
-    Err(format!("`mise use -g {spec}` exited with {status}"))
+fn install_with_mise(spec: &str, runner: &CommandRunner) -> Result<(), String> {
+    runner
+        .run_streaming_visible_blocking("mise", &["use", "-g", spec], None)
+        .map(|_| ())
+        .map_err(|err| format_process_failure(&format!("`mise use -g {spec}`"), err))
 }
 
-fn format_command_context(stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout);
-    let stderr = String::from_utf8_lossy(stderr);
+fn format_command_context(stdout: &str, stderr: &str) -> String {
     let detail = stdout
         .lines()
         .chain(stderr.lines())
@@ -236,6 +214,17 @@ fn format_command_context(stdout: &[u8], stderr: &[u8]) -> String {
     match detail {
         Some(line) => format!(": {line}"),
         None => String::new(),
+    }
+}
+
+fn format_process_failure(command: &str, error: ProcessError) -> String {
+    match error {
+        ProcessError::NonZeroExit { status, output } => format!(
+            "{command} exited with {}{}",
+            status,
+            format_command_context(&output.stdout, &output.stderr)
+        ),
+        other => format!("failed to run {command}: {other}"),
     }
 }
 
