@@ -1,8 +1,14 @@
+use std::ffi::OsStr;
+use std::path::PathBuf;
+
 use serde::Deserialize;
 use sysinfo::System;
 use tracing::{debug, warn};
 
 use crate::probe::{Acceleration, DeviceCapabilities, DeviceProber, ProbeError};
+
+const LLMFIT_CLI: &str = "llmfit";
+const LLMFIT_INSTALL_SPEC: &str = "cargo:llmfit@latest";
 
 /// Device prober that tries `llmfit system --json` first, then falls back
 /// to sysinfo for basic capability detection.
@@ -20,6 +26,22 @@ struct LlmfitOutput {
     cpu_cores: Option<usize>,
     #[serde(default)]
     acceleration: Option<String>,
+    #[serde(default)]
+    system: Option<LlmfitSystemOutput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmfitSystemOutput {
+    #[serde(default)]
+    available_ram_gb: Option<f64>,
+    #[serde(default)]
+    total_ram_gb: Option<f64>,
+    #[serde(default)]
+    gpu_vram_gb: Option<f64>,
+    #[serde(default)]
+    cpu_cores: Option<usize>,
+    #[serde(default)]
+    backend: Option<String>,
 }
 
 impl LlmfitProber {
@@ -29,57 +51,72 @@ impl LlmfitProber {
 
     /// Try probing via `llmfit system --json` CLI.
     fn try_llmfit(&self) -> Option<DeviceCapabilities> {
-        let run_cmd = || {
-            std::process::Command::new("llmfit")
-                .args(["system", "--json"])
-                .output()
-        };
+        let mut failures = Vec::new();
 
-        let mut output = run_cmd();
-
-        if output.is_err() {
-            // Try to auto-install via mise if not found
-            debug!("llmfit not found, attempting to install via mise...");
-            let install_status = std::process::Command::new("mise")
-                .args(["use", "-g", "cargo:llmfit@latest"])
-                .status();
-
-            if let Ok(status) = install_status {
-                if status.success() {
-                    debug!("llmfit successfully installed via mise");
-                    // Try running again after installation
-                    output = run_cmd();
-                    
-                    // If llmfit is still not in PATH (shims not configured), try running it via mise exec
-                    if output.is_err() {
-                        output = std::process::Command::new("mise")
-                            .args(["exec", "--", "llmfit", "system", "--json"])
-                            .output();
-                    }
-                } else {
-                    warn!("failed to install llmfit via mise");
-                }
+        if let Ok(path) = resolve_mise_binary(LLMFIT_CLI) {
+            match run_llmfit_command(path.as_os_str()) {
+                Ok(caps) => return Some(caps),
+                Err(reason) => failures.push(format!("mise-managed {LLMFIT_CLI}: {reason}")),
             }
         }
 
-        let output = output.ok()?;
-
-        if !output.status.success() {
-            return None;
+        match run_llmfit_command(OsStr::new(LLMFIT_CLI)) {
+            Ok(caps) => return Some(caps),
+            Err(reason) => failures.push(format!("PATH {LLMFIT_CLI}: {reason}")),
         }
 
-        let parsed: LlmfitOutput = serde_json::from_slice(&output.stdout).ok()?;
+        debug!("llmfit unavailable, attempting to install/activate via mise use -g...");
+        match install_with_mise(LLMFIT_INSTALL_SPEC) {
+            Ok(()) => match resolve_mise_binary(LLMFIT_CLI) {
+                Ok(path) => match run_llmfit_command(path.as_os_str()) {
+                    Ok(caps) => return Some(caps),
+                    Err(reason) => {
+                        failures.push(format!("mise-managed {LLMFIT_CLI} after install: {reason}"))
+                    }
+                },
+                Err(reason) => failures.push(format!(
+                    "unable to resolve {LLMFIT_CLI} via mise after install: {reason}"
+                )),
+            },
+            Err(reason) => failures.push(reason),
+        }
 
+        warn!(
+            attempts = %failures.join(" | "),
+            "llmfit unavailable after PATH and mise attempts, falling back to sysinfo"
+        );
+        None
+    }
+
+    fn parse_llmfit_output(stdout: &[u8]) -> Result<DeviceCapabilities, String> {
+        let parsed: LlmfitOutput =
+            serde_json::from_slice(stdout).map_err(|e| format!("invalid llmfit JSON: {e}"))?;
+        let system = parsed.system.as_ref();
         let acceleration = parsed
             .acceleration
             .as_deref()
+            .or_else(|| system.and_then(|info| info.backend.as_deref()))
             .map(parse_acceleration)
             .unwrap_or(Acceleration::Cpu);
 
-        Some(DeviceCapabilities {
-            ram_mb: parsed.ram_mb.unwrap_or(0),
-            vram_mb: parsed.vram_mb,
-            cpu_cores: parsed.cpu_cores.unwrap_or(1),
+        Ok(DeviceCapabilities {
+            ram_mb: parsed
+                .ram_mb
+                .or_else(|| {
+                    system.and_then(|info| {
+                        info.total_ram_gb
+                            .or(info.available_ram_gb)
+                            .map(gigabytes_to_mb)
+                    })
+                })
+                .unwrap_or(0),
+            vram_mb: parsed
+                .vram_mb
+                .or_else(|| system.and_then(|info| info.gpu_vram_gb.map(gigabytes_to_mb))),
+            cpu_cores: parsed
+                .cpu_cores
+                .or_else(|| system.and_then(|info| info.cpu_cores))
+                .unwrap_or(1),
             disk_free_bytes: probe_disk_free(),
             acceleration,
             is_termux: detect_termux(),
@@ -114,7 +151,7 @@ impl DeviceProber for LlmfitProber {
             return Ok(caps);
         }
 
-        warn!("llmfit not available, falling back to sysinfo");
+        warn!("llmfit probe failed, falling back to sysinfo");
         let caps = self.probe_sysinfo();
         debug!(?caps, "probed via sysinfo");
         Ok(caps)
@@ -126,6 +163,81 @@ fn parse_acceleration(s: &str) -> Acceleration {
         "cuda" | "nvidia" => Acceleration::Cuda,
         "metal" | "mps" => Acceleration::Metal,
         _ => Acceleration::Cpu,
+    }
+}
+
+fn gigabytes_to_mb(value: f64) -> u64 {
+    (value * 1024.0).round().max(0.0) as u64
+}
+
+fn run_llmfit_command(program: &OsStr) -> Result<DeviceCapabilities, String> {
+    let output = std::process::Command::new(program)
+        .args(["system", "--json"])
+        .output()
+        .map_err(|e| format!("failed to spawn llmfit system --json: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "llmfit system --json exited with {}{}",
+            output.status,
+            format_command_context(&output.stdout, &output.stderr)
+        ));
+    }
+
+    LlmfitProber::parse_llmfit_output(&output.stdout)
+}
+
+fn resolve_mise_binary(tool: &str) -> Result<PathBuf, String> {
+    let output = std::process::Command::new("mise")
+        .args(["which", tool])
+        .output()
+        .map_err(|e| format!("failed to spawn `mise which {tool}`: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "`mise which {tool}` exited with {}{}",
+            output.status,
+            format_command_context(&output.stdout, &output.stderr)
+        ));
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err(format!("`mise which {tool}` returned an empty path"));
+    }
+
+    Ok(PathBuf::from(path))
+}
+
+fn install_with_mise(spec: &str) -> Result<(), String> {
+    let output = std::process::Command::new("mise")
+        .args(["use", "-g", spec])
+        .output()
+        .map_err(|e| format!("failed to spawn `mise use -g {spec}`: {e}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "`mise use -g {spec}` exited with {}{}",
+        output.status,
+        format_command_context(&output.stdout, &output.stderr)
+    ))
+}
+
+fn format_command_context(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let detail = stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty());
+
+    match detail {
+        Some(line) => format!(": {line}"),
+        None => String::new(),
     }
 }
 
@@ -208,5 +320,23 @@ mod tests {
             ..caps.clone()
         };
         assert!(!small.can_run_local_whisper());
+    }
+
+    #[test]
+    fn test_parse_llmfit_nested_system_output() {
+        let json = br#"{
+          "system": {
+            "total_ram_gb": 31.05,
+            "gpu_vram_gb": 8.0,
+            "cpu_cores": 20,
+            "backend": "CUDA"
+          }
+        }"#;
+
+        let caps = LlmfitProber::parse_llmfit_output(json).unwrap();
+        assert_eq!(caps.acceleration, Acceleration::Cuda);
+        assert_eq!(caps.cpu_cores, 20);
+        assert_eq!(caps.ram_mb, 31_795);
+        assert_eq!(caps.vram_mb, Some(8_192));
     }
 }

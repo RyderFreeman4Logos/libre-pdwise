@@ -8,6 +8,8 @@ use tracing::{debug, instrument};
 use crate::engine::{AsrEngine, AsrError};
 
 const SHERPA_CLI: &str = "sherpa-onnx-offline";
+const SHERPA_MISE_SPEC: &str = "github:k2-fsa/sherpa-onnx";
+const SHERPA_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default HuggingFace model identifier for sherpa-onnx transducer.
 const DEFAULT_MODEL_NAME: &str =
@@ -50,55 +52,81 @@ impl SherpaOnnxEngine {
         Ok(())
     }
 
-    /// Check if the sherpa-onnx CLI is available on PATH or via mise, installing it globally if needed.
-    /// Returns the command and base arguments to use.
-    async fn resolve_cli(&self) -> Result<(String, Vec<String>), AsrError> {
-        let check_direct = || async {
-            let result = self.runner.run_checked(SHERPA_CLI, &["--help"]).await;
-            match result {
-                Ok(_) => true,
-                Err(ProcessError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Err(ProcessError::NonZeroExit { .. }) => true, // --help may exit non-zero
-                Err(_) => false,
-            }
-        };
+    /// Resolve the sherpa-onnx executable, preferring the mise-managed binary
+    /// when available so PATH/shim mismatches do not break transcription.
+    async fn resolve_cli(&self) -> Result<String, AsrError> {
+        let mut failures = Vec::new();
 
-        if check_direct().await {
-            return Ok((SHERPA_CLI.to_string(), vec![]));
+        if let Some(path) = self.resolve_mise_binary().await {
+            match self.probe_cli_candidate(path.as_str()).await {
+                Ok(()) => return Ok(path),
+                Err(reason) => failures.push(format!("mise-managed {SHERPA_CLI}: {reason}")),
+            }
+        }
+        failures.push(
+            "`mise which sherpa-onnx-offline` did not resolve a healthy active binary".to_string(),
+        );
+
+        match self.probe_cli_candidate(SHERPA_CLI).await {
+            Ok(()) => return Ok(SHERPA_CLI.to_string()),
+            Err(reason) => failures.push(format!("PATH {SHERPA_CLI}: {reason}")),
         }
 
-        // Try installing globally via mise
-        debug!("sherpa-onnx not found, attempting to install via mise use -g...");
-        let install_result = self.runner.run_checked("mise", &["use", "-g", "github:k2-fsa/sherpa-onnx"]).await;
-        
-        if install_result.is_ok() {
-            debug!("sherpa-onnx successfully installed via mise");
-            if check_direct().await {
-                return Ok((SHERPA_CLI.to_string(), vec![]));
+        debug!("sherpa-onnx unavailable, attempting to install/activate via mise use -g...");
+        match self
+            .runner
+            .run_checked("mise", &["use", "-g", SHERPA_MISE_SPEC])
+            .await
+        {
+            Ok(_) => {
+                if let Some(path) = self.resolve_mise_binary().await {
+                    match self.probe_cli_candidate(path.as_str()).await {
+                        Ok(()) => return Ok(path),
+                        Err(reason) => failures
+                            .push(format!("mise-managed {SHERPA_CLI} after install: {reason}")),
+                    }
+                }
+                failures.push(format!(
+                    "`mise use -g {SHERPA_MISE_SPEC}` succeeded but no healthy active {SHERPA_CLI} binary was resolved"
+                ));
             }
-
-            // Fallback to `mise exec` if the shim is not in PATH
-            let mise_args = vec!["exec".to_string(), "--".to_string(), SHERPA_CLI.to_string()];
-            let arg_refs: Vec<&str> = mise_args.iter().map(|s| s.as_str()).collect();
-            let exec_result = self.runner.run_checked("mise", &arg_refs).await;
-            
-            let mise_exec_found = match exec_result {
-                Ok(_) => true,
-                Err(ProcessError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Err(ProcessError::NonZeroExit { .. }) => true, // It ran but exited non-zero
-                Err(_) => false,
-            };
-
-            if mise_exec_found {
-                return Ok(("mise".to_string(), mise_args));
-            }
+            Err(e) => failures.push(format!("`mise use -g {SHERPA_MISE_SPEC}` failed: {e}")),
         }
 
         Err(AsrError::NotAvailable(format!(
-            "{SHERPA_CLI} not found, and `mise use -g` failed to install it. \
-             Please install sherpa-onnx manually: \
-             https://k2-fsa.github.io/sherpa/onnx/install.html"
+            "{SHERPA_CLI} unavailable after PATH and mise resolution attempts: {}. \
+             Install sherpa-onnx with `mise use -g {SHERPA_MISE_SPEC}` or follow \
+             https://k2-fsa.github.io/sherpa/onnx/install.html",
+            failures.join(" | ")
         )))
+    }
+
+    async fn resolve_mise_binary(&self) -> Option<String> {
+        let output = self
+            .runner
+            .run_checked("mise", &["which", SHERPA_CLI])
+            .await
+            .ok()?;
+        let path = output.stdout.trim();
+        if path.is_empty() {
+            None
+        } else {
+            Some(path.to_string())
+        }
+    }
+
+    async fn probe_cli_candidate(&self, program: &str) -> Result<(), String> {
+        let probe_runner = CommandRunner::new(SHERPA_PROBE_TIMEOUT);
+        match probe_runner.run_checked(program, &["--help"]).await {
+            Ok(_) | Err(ProcessError::NonZeroExit { .. }) => Ok(()),
+            Err(ProcessError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err("not found".to_string())
+            }
+            Err(ProcessError::Timeout(timeout)) => {
+                Err(format!("timed out during --help probe after {timeout:?}"))
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// Find the encoder, decoder, joiner, and tokens files in model_dir.
@@ -162,12 +190,12 @@ struct SherpaModelFiles {
 impl AsrEngine for SherpaOnnxEngine {
     #[instrument(skip(self), fields(chunk_index = chunk.index, model_dir = %self.model_dir.display()))]
     async fn transcribe(&self, chunk: &AudioChunk) -> Result<Vec<TranscriptSegment>, AsrError> {
-        let (cmd, mut args) = self.resolve_cli().await?;
+        let cmd = self.resolve_cli().await?;
         self.ensure_model().await?;
 
         let model_files = self.find_model_files()?;
 
-        args.extend(vec![
+        let args = vec![
             "--encoder".to_string(),
             model_files.encoder.to_string_lossy().into_owned(),
             "--decoder".to_string(),
@@ -177,7 +205,7 @@ impl AsrEngine for SherpaOnnxEngine {
             "--tokens".to_string(),
             model_files.tokens.to_string_lossy().into_owned(),
             chunk.path.to_string_lossy().into_owned(),
-        ]);
+        ];
 
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
