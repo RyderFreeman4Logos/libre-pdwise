@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -45,7 +46,9 @@ impl ClipboardProvider for TermuxClipboard {
                 .spawn()?;
 
             let mut stdin = child.stdin.take().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "failed to open stdin")
+                ClipboardError::Unavailable(
+                    anyhow!("failed to open stdin pipe for termux-clipboard-set").to_string(),
+                )
             })?;
 
             let write_handle = s.spawn(move || stdin.write_all(content.as_bytes()));

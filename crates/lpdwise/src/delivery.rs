@@ -93,7 +93,6 @@ pub(crate) enum DeliveryError {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::path::Path;
     use std::time::Duration;
 
     use lpdwise_core::types::TranscriptSegment;
@@ -146,7 +145,7 @@ mod tests {
     }
 
     fn temp_dir_in_tmp() -> tempfile::TempDir {
-        tempfile::tempdir_in(Path::new("/tmp")).unwrap()
+        tempfile::tempdir().unwrap()
     }
 
     #[test]

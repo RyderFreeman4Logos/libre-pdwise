@@ -17,6 +17,7 @@ impl Default for StdinProvider {
 
 impl ClipboardProvider for StdinProvider {
     fn get_content(&self) -> Result<String, ClipboardError> {
+        eprintln!("No clipboard backend available. Please paste your input and press Enter:");
         let mut buffer = String::new();
         std::io::stdin().read_line(&mut buffer)?;
         Ok(buffer.trim_end_matches(&['\r', '\n'][..]).to_string())

@@ -98,12 +98,10 @@ pub(crate) enum InputError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
 
     fn temp_file_in_tmp() -> tempfile::NamedTempFile {
-        tempfile::NamedTempFile::new_in(Path::new("/tmp")).unwrap()
+        tempfile::NamedTempFile::new().unwrap()
     }
 
     #[test]
