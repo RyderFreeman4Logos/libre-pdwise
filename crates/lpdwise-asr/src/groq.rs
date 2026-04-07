@@ -7,8 +7,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::engine::{AsrEngine, AsrError};
 
-const GROQ_TRANSCRIPTIONS_URL: &str =
-    "https://api.groq.com/openai/v1/audio/transcriptions";
+const GROQ_TRANSCRIPTIONS_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 const MODEL: &str = "whisper-large-v3";
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -41,10 +40,7 @@ impl GroqWhisperEngine {
 
     /// Send a single audio file to the Groq Whisper API with retry on 429.
     #[instrument(skip(self, audio_path), fields(path = %audio_path.display()))]
-    async fn call_api(
-        &self,
-        audio_path: &std::path::Path,
-    ) -> Result<GroqResponse, AsrError> {
+    async fn call_api(&self, audio_path: &std::path::Path) -> Result<GroqResponse, AsrError> {
         let file_bytes = tokio::fs::read(audio_path).await.map_err(AsrError::Io)?;
 
         let file_name = audio_path
@@ -83,12 +79,8 @@ impl GroqWhisperEngine {
                     .await
                     .map_err(|e| AsrError::ApiRequest(e.to_string()))?;
 
-                let parsed: GroqResponse =
-                    serde_json::from_str(&body).map_err(|e| {
-                        AsrError::Decode(format!(
-                            "failed to parse Groq response: {e}"
-                        ))
-                    })?;
+                let parsed: GroqResponse = serde_json::from_str(&body)
+                    .map_err(|e| AsrError::Decode(format!("failed to parse Groq response: {e}")))?;
 
                 return Ok(parsed);
             }
@@ -123,10 +115,7 @@ impl GroqWhisperEngine {
 
 impl AsrEngine for GroqWhisperEngine {
     #[instrument(skip(self), fields(chunk_index = chunk.index))]
-    async fn transcribe(
-        &self,
-        chunk: &AudioChunk,
-    ) -> Result<Vec<TranscriptSegment>, AsrError> {
+    async fn transcribe(&self, chunk: &AudioChunk) -> Result<Vec<TranscriptSegment>, AsrError> {
         let response = self.call_api(&chunk.path).await?;
 
         let segments = match response.segments {

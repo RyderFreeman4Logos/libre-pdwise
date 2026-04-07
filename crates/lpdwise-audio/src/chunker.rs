@@ -87,11 +87,9 @@ pub async fn detect_silences(
 ///   [silencedetect @ ...] silence_start: 1.234
 ///   [silencedetect @ ...] silence_end: 2.567 | silence_duration: 1.333
 fn parse_silencedetect_output(stderr: &str) -> Vec<SilenceGap> {
-    let start_re =
-        Regex::new(r"silence_start:\s*([\d.]+)").expect("valid regex");
-    let end_re =
-        Regex::new(r"silence_end:\s*([\d.]+)\s*\|\s*silence_duration:\s*([\d.]+)")
-            .expect("valid regex");
+    let start_re = Regex::new(r"silence_start:\s*([\d.]+)").expect("valid regex");
+    let end_re = Regex::new(r"silence_end:\s*([\d.]+)\s*\|\s*silence_duration:\s*([\d.]+)")
+        .expect("valid regex");
 
     let mut pending_start: Option<u64> = None;
     let mut gaps = Vec::new();
@@ -108,8 +106,7 @@ fn parse_silencedetect_output(stderr: &str) -> Vec<SilenceGap> {
             let end_ms = seconds_to_ms(end_secs);
             let duration_ms = seconds_to_ms(dur_secs);
 
-            let start_ms = pending_start
-                .unwrap_or_else(|| end_ms.saturating_sub(duration_ms));
+            let start_ms = pending_start.unwrap_or_else(|| end_ms.saturating_sub(duration_ms));
 
             gaps.push(SilenceGap {
                 start_ms,
@@ -195,13 +192,13 @@ pub fn adaptive_chunk(
 
     info!(
         cuts = cut_offsets.len(),
-        pieces,
-        total_size_bytes,
-        max_bytes,
-        "computed adaptive chunk cut points"
+        pieces, total_size_bytes, max_bytes, "computed adaptive chunk cut points"
     );
 
-    cut_offsets.into_iter().map(|ms| CutPoint { offset_ms: ms }).collect()
+    cut_offsets
+        .into_iter()
+        .map(|ms| CutPoint { offset_ms: ms })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -360,8 +357,7 @@ mod tests {
     #[test]
     fn test_parse_silencedetect_no_start_line() {
         // Some ffmpeg versions may only emit end lines.
-        let stderr =
-            "[silencedetect @ 0x1] silence_end: 5.0 | silence_duration: 2.0\n";
+        let stderr = "[silencedetect @ 0x1] silence_end: 5.0 | silence_duration: 2.0\n";
         let gaps = parse_silencedetect_output(stderr);
         assert_eq!(gaps.len(), 1);
         // Inferred start: end - duration = 5000 - 2000 = 3000.
@@ -393,12 +389,7 @@ mod tests {
             },
         ];
 
-        let cuts = adaptive_chunk(
-            &silences,
-            60_000,
-            50 * 1024 * 1024,
-            DEFAULT_MAX_CHUNK_BYTES,
-        );
+        let cuts = adaptive_chunk(&silences, 60_000, 50 * 1024 * 1024, DEFAULT_MAX_CHUNK_BYTES);
         assert_eq!(cuts.len(), 1);
         // Should pick the longest silence (2000ms), midpoint = 29000 + 1000 = 30000.
         assert_eq!(cuts[0].offset_ms, 30_000);
@@ -407,12 +398,7 @@ mod tests {
     #[test]
     fn test_adaptive_fallback_fixed_duration() {
         // 75 MB → 3 pieces → 2 cuts needed, but no silence gaps.
-        let cuts = adaptive_chunk(
-            &[],
-            120_000,
-            75 * 1024 * 1024,
-            DEFAULT_MAX_CHUNK_BYTES,
-        );
+        let cuts = adaptive_chunk(&[], 120_000, 75 * 1024 * 1024, DEFAULT_MAX_CHUNK_BYTES);
         assert_eq!(cuts.len(), 2);
         // Fixed intervals: 120000 / 3 = 40000 → cuts at 40000, 80000.
         assert_eq!(cuts[0].offset_ms, 40_000);
@@ -453,15 +439,9 @@ mod tests {
         std::fs::write(&fake_audio, b"fake audio").unwrap();
 
         let runner = CommandRunner::with_default_timeout();
-        let result = split_audio(
-            &fake_audio,
-            &[],
-            tmp.path(),
-            &runner,
-            60_000,
-        )
-        .await
-        .unwrap();
+        let result = split_audio(&fake_audio, &[], tmp.path(), &runner, 60_000)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].index, 0);
@@ -477,14 +457,7 @@ mod tests {
         std::fs::write(&fake_audio, b"").unwrap();
 
         let runner = CommandRunner::with_default_timeout();
-        let result = split_audio(
-            &fake_audio,
-            &[],
-            tmp.path(),
-            &runner,
-            0,
-        )
-        .await;
+        let result = split_audio(&fake_audio, &[], tmp.path(), &runner, 0).await;
 
         assert!(result.is_err());
     }

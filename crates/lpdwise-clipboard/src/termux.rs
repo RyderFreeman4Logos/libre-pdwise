@@ -52,9 +52,7 @@ impl ClipboardProvider for TermuxClipboard {
 
             let output = child.wait_with_output()?;
 
-            write_handle
-                .join()
-                .expect("stdin writer thread panicked")?;
+            write_handle.join().expect("stdin writer thread panicked")?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);

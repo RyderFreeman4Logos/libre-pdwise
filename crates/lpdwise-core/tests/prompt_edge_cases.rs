@@ -69,7 +69,12 @@ fn test_long_transcript_preserves_tail_placement() {
 #[test]
 fn test_all_templates_render_all_languages() {
     let transcript = single_segment_transcript();
-    let languages = [Language::Chinese, Language::English, Language::Japanese, Language::Auto];
+    let languages = [
+        Language::Chinese,
+        Language::English,
+        Language::Japanese,
+        Language::Auto,
+    ];
 
     for template in PromptTemplate::ALL {
         for lang in &languages {

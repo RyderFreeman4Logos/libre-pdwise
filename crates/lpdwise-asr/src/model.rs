@@ -47,12 +47,9 @@ pub async fn download_model(
         .await
         .map_err(ModelError::Io)?;
 
-    let hf_base = std::env::var("HF_MIRROR")
-        .unwrap_or_else(|_| "https://huggingface.co".into());
+    let hf_base = std::env::var("HF_MIRROR").unwrap_or_else(|_| "https://huggingface.co".into());
 
-    let url = format!(
-        "{hf_base}/{model_name}/resolve/main/model.tar.gz"
-    );
+    let url = format!("{hf_base}/{model_name}/resolve/main/model.tar.gz");
 
     info!(url = %url, "downloading model");
 
@@ -148,8 +145,7 @@ mod tests {
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join(".sha256_verified"), b"verified").unwrap();
 
-        let result =
-            download_model(model_name, tmp.path(), None).await.unwrap();
+        let result = download_model(model_name, tmp.path(), None).await.unwrap();
         assert_eq!(result, model_dir);
     }
 }

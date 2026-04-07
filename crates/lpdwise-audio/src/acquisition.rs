@@ -185,8 +185,9 @@ fn find_output_file(base_path: &Path) -> Result<PathBuf, AcquisitionError> {
     }
 
     // yt-dlp commonly appends the audio format extension
+    let base_str = base_path.to_string_lossy();
     for ext in &["opus", "m4a", "mp3", "wav", "webm"] {
-        let candidate = base_path.with_extension(ext);
+        let candidate = PathBuf::from(format!("{base_str}.{ext}"));
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -226,9 +227,7 @@ async fn probe_media(
     path: &Path,
     runner: &CommandRunner,
 ) -> Result<(Option<Duration>, u64), AcquisitionError> {
-    let size_bytes = std::fs::metadata(path)
-        .map_err(AcquisitionError::Io)?
-        .len();
+    let size_bytes = std::fs::metadata(path).map_err(AcquisitionError::Io)?.len();
 
     let path_str = path.to_string_lossy();
     let duration = match runner
@@ -258,10 +257,7 @@ async fn probe_media(
 /// Expected format: `{"format": {"duration": "123.456"}}`
 fn parse_ffprobe_duration(json_str: &str) -> Option<Duration> {
     let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    let duration_str = value
-        .get("format")?
-        .get("duration")?
-        .as_str()?;
+    let duration_str = value.get("format")?.get("duration")?.as_str()?;
     let seconds: f64 = duration_str.parse().ok()?;
     Some(Duration::from_secs_f64(seconds))
 }
@@ -340,6 +336,17 @@ mod tests {
     fn test_sanitize_filename_empty_fallback() {
         let result = sanitize_filename("://");
         assert_eq!(result, "download");
+    }
+
+    #[test]
+    fn test_find_output_file_keeps_youtu_be_stem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("https___youtu.be_Rqm2BJKeCgA");
+        let actual = base.with_file_name("https___youtu.be_Rqm2BJKeCgA.opus");
+        std::fs::write(&actual, b"").unwrap();
+
+        let found = find_output_file(&base).unwrap();
+        assert_eq!(found, actual);
     }
 
     #[test]

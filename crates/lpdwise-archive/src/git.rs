@@ -41,8 +41,8 @@ impl GitArchiver {
             Repository::open(archive_dir).map_err(|e| ArchiveError::Git(e.to_string()))?;
         } else {
             info!(path = %archive_dir.display(), "initializing new archive repo");
-            let repo = Repository::init(archive_dir)
-                .map_err(|e| ArchiveError::Git(e.to_string()))?;
+            let repo =
+                Repository::init(archive_dir).map_err(|e| ArchiveError::Git(e.to_string()))?;
 
             // Write .gitignore to exclude media files
             fs::write(
@@ -52,8 +52,7 @@ impl GitArchiver {
 
             // Initial commit with .gitignore
             let sig = default_signature(&repo)?;
-            let mut index =
-                repo.index().map_err(|e| ArchiveError::Git(e.to_string()))?;
+            let mut index = repo.index().map_err(|e| ArchiveError::Git(e.to_string()))?;
             index
                 .add_path(Path::new(".gitignore"))
                 .map_err(|e| ArchiveError::Git(e.to_string()))?;
@@ -122,7 +121,9 @@ impl Archiver for GitArchiver {
         index
             .add_path(Path::new(&srt_name))
             .map_err(|e| ArchiveError::Git(e.to_string()))?;
-        index.write().map_err(|e| ArchiveError::Git(e.to_string()))?;
+        index
+            .write()
+            .map_err(|e| ArchiveError::Git(e.to_string()))?;
 
         let tree_oid = index
             .write_tree()
@@ -136,7 +137,10 @@ impl Archiver for GitArchiver {
             InputSource::Url(u) => u.as_str(),
             InputSource::File(p) => p.to_str().unwrap_or("local-file"),
         };
-        let message = format!("archive: {source_label}\n\nextracted_at: {}", record.extracted_at);
+        let message = format!(
+            "archive: {source_label}\n\nextracted_at: {}",
+            record.extracted_at
+        );
 
         // Get parent commit (HEAD)
         let parent = repo

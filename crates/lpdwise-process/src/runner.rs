@@ -2,8 +2,9 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 /// Default subprocess timeout: 30 minutes.
@@ -100,6 +101,181 @@ impl CommandRunner {
             libc::kill(pgid, libc::SIGKILL);
         }
     }
+
+    async fn pump_stream<R, W>(
+        reader: Option<R>,
+        stream: &'static str,
+        mut terminal: Option<W>,
+        log_writer: Option<std::sync::Arc<Mutex<tokio::fs::File>>>,
+    ) -> Result<Vec<String>, std::io::Error>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut lines = Vec::new();
+        if let Some(reader) = reader {
+            let mut reader = BufReader::new(reader).lines();
+            while let Some(line) = reader.next_line().await? {
+                match stream {
+                    "stdout" => debug!(stream = stream, "{}", line),
+                    "stderr" => warn!(stream = stream, "{}", line),
+                    _ => debug!(stream = stream, "{}", line),
+                }
+
+                if let Some(writer) = terminal.as_mut() {
+                    writer.write_all(line.as_bytes()).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await?;
+                }
+
+                if let Some(log_writer) = &log_writer {
+                    let mut writer = log_writer.lock().await;
+                    writer
+                        .write_all(format!("[{stream}] {line}\n").as_bytes())
+                        .await?;
+                    writer.flush().await?;
+                }
+
+                lines.push(line);
+            }
+        }
+
+        Ok(lines)
+    }
+
+    async fn run_streaming_internal(
+        &self,
+        program: &str,
+        args: &[&str],
+        log_file: Option<&Path>,
+        forward_output: bool,
+    ) -> Result<ProcessOutput, ProcessError> {
+        debug!(program, ?args, forward_output, "spawning streaming command");
+
+        let mut cmd = Self::build_command(program, args);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn()?;
+        let pid = child.id().ok_or(ProcessError::NoPid)?;
+
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
+
+        let log_writer = match log_file {
+            Some(path) => {
+                let file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .await?;
+                Some(std::sync::Arc::new(Mutex::new(file)))
+            }
+            None => None,
+        };
+
+        let stdout_handle = tokio::spawn(Self::pump_stream(
+            child_stdout,
+            "stdout",
+            forward_output.then(tokio::io::stdout),
+            log_writer.clone(),
+        ));
+
+        let stderr_handle = tokio::spawn(Self::pump_stream(
+            child_stderr,
+            "stderr",
+            forward_output.then(tokio::io::stderr),
+            log_writer,
+        ));
+
+        let wait_future = async {
+            let stdout_lines = stdout_handle.await.map_err(std::io::Error::other)??;
+            let stderr_lines = stderr_handle.await.map_err(std::io::Error::other)??;
+            let status = child.wait().await?;
+
+            Ok::<(ExitStatus, String, String), std::io::Error>((
+                status,
+                stdout_lines.join("\n"),
+                stderr_lines.join("\n"),
+            ))
+        };
+
+        let result = tokio::time::timeout(self.timeout, wait_future).await;
+
+        match result {
+            Ok(Ok((status, stdout, stderr))) => {
+                let code = status.code().unwrap_or(-1);
+                let proc_output = ProcessOutput {
+                    stdout,
+                    stderr,
+                    exit_code: code,
+                };
+
+                if status.success() {
+                    Ok(proc_output)
+                } else {
+                    Err(ProcessError::NonZeroExit {
+                        status,
+                        output: proc_output,
+                    })
+                }
+            }
+            Ok(Err(io_err)) => {
+                Self::kill_process_group(pid).await;
+                let _ = child.wait().await;
+                Err(ProcessError::Io(io_err))
+            }
+            Err(_elapsed) => {
+                Self::kill_process_group(pid).await;
+                let _ = child.wait().await;
+                Err(ProcessError::Timeout(self.timeout))
+            }
+        }
+    }
+
+    /// Run a command while mirroring stdout/stderr to the user's terminal.
+    ///
+    /// Output is still buffered in the returned `ProcessOutput`, and timeout /
+    /// process-group cleanup semantics match the other runner APIs.
+    pub async fn run_streaming_visible(
+        &self,
+        program: &str,
+        args: &[&str],
+        log_file: Option<&Path>,
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_streaming_internal(program, args, log_file, true)
+            .await
+    }
+
+    /// Block on a checked subprocess using a dedicated current-thread runtime.
+    ///
+    /// Synchronous callers inside async code should offload this wrapper with
+    /// `tokio::task::spawn_blocking` so reactor threads remain unblocked.
+    pub fn run_checked_blocking(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> Result<ProcessOutput, ProcessError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(ProcessError::Io)?;
+        runtime.block_on(self.run_checked(program, args))
+    }
+
+    /// Blocking counterpart to `run_streaming_visible`.
+    pub fn run_streaming_visible_blocking(
+        &self,
+        program: &str,
+        args: &[&str],
+        log_file: Option<&Path>,
+    ) -> Result<ProcessOutput, ProcessError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(ProcessError::Io)?;
+        runtime.block_on(self.run_streaming_visible(program, args, log_file))
+    }
 }
 
 impl Default for CommandRunner {
@@ -186,10 +362,12 @@ impl ProcessRunner for CommandRunner {
             }
             Ok(Err(io_err)) => {
                 Self::kill_process_group(pid).await;
+                let _ = child.wait().await;
                 Err(ProcessError::Io(io_err))
             }
             Err(_elapsed) => {
                 Self::kill_process_group(pid).await;
+                let _ = child.wait().await;
                 Err(ProcessError::Timeout(self.timeout))
             }
         }
@@ -201,120 +379,8 @@ impl ProcessRunner for CommandRunner {
         args: &[&str],
         log_file: Option<&Path>,
     ) -> Result<ProcessOutput, ProcessError> {
-        debug!(program, ?args, "spawning streaming command");
-
-        let mut cmd = Self::build_command(program, args);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = cmd.spawn()?;
-        let pid = child.id().ok_or(ProcessError::NoPid)?;
-
-        let child_stdout = child.stdout.take();
-        let child_stderr = child.stderr.take();
-
-        let mut log_writer = match log_file {
-            Some(path) => {
-                let file = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .await?;
-                Some(file)
-            }
-            None => None,
-        };
-
-        // Read stdout and stderr concurrently, buffering and streaming each
-        // line as it arrives.
-        let stdout_handle = tokio::spawn(async move {
-            let mut lines = Vec::new();
-            if let Some(out) = child_stdout {
-                let mut reader = BufReader::new(out).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    lines.push(line);
-                }
-            }
-            lines
-        });
-
-        let stderr_handle = tokio::spawn(async move {
-            let mut lines = Vec::new();
-            if let Some(err) = child_stderr {
-                let mut reader = BufReader::new(err).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    lines.push(line);
-                }
-            }
-            lines
-        });
-
-        let wait_future = async {
-            let stdout_lines = stdout_handle.await.map_err(std::io::Error::other)?;
-            let stderr_lines = stderr_handle.await.map_err(std::io::Error::other)?;
-
-            // Stream to terminal via tracing and optionally to log file
-            for line in &stdout_lines {
-                debug!(stream = "stdout", "{}", line);
-            }
-            for line in &stderr_lines {
-                warn!(stream = "stderr", "{}", line);
-            }
-
-            if let Some(ref mut writer) = log_writer {
-                for line in &stdout_lines {
-                    writer
-                        .write_all(format!("[stdout] {line}\n").as_bytes())
-                        .await?;
-                }
-                for line in &stderr_lines {
-                    writer
-                        .write_all(format!("[stderr] {line}\n").as_bytes())
-                        .await?;
-                }
-                writer.flush().await?;
-            }
-
-            let status = child.wait().await?;
-
-            Ok::<(ExitStatus, String, String), std::io::Error>((
-                status,
-                stdout_lines.join("\n"),
-                stderr_lines.join("\n"),
-            ))
-        };
-
-        let result = tokio::time::timeout(self.timeout, wait_future).await;
-
-        match result {
-            Ok(Ok((status, stdout, stderr))) => {
-                let code = status.code().unwrap_or(-1);
-                let proc_output = ProcessOutput {
-                    stdout,
-                    stderr,
-                    exit_code: code,
-                };
-
-                if status.success() {
-                    Ok(proc_output)
-                } else {
-                    Err(ProcessError::NonZeroExit {
-                        status,
-                        output: proc_output,
-                    })
-                }
-            }
-            Ok(Err(io_err)) => {
-                Self::kill_process_group(pid).await;
-                let _ = child.wait().await;
-                Err(ProcessError::Io(io_err))
-            }
-            Err(_elapsed) => {
-                Self::kill_process_group(pid).await;
-                let _ = child.wait().await;
-                Err(ProcessError::Timeout(self.timeout))
-            }
-        }
+        self.run_streaming_internal(program, args, log_file, false)
+            .await
     }
 }
 
@@ -439,5 +505,25 @@ mod tests {
             matches!(err, ProcessError::Timeout(_)),
             "expected Timeout, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn test_run_checked_blocking_echo() {
+        let runner = CommandRunner::with_default_timeout();
+        let output = runner.run_checked_blocking("echo", &["hello"]).unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout.trim(), "hello");
+    }
+
+    #[test]
+    fn test_run_streaming_visible_blocking_echo() {
+        let runner = CommandRunner::with_default_timeout();
+        let output = runner
+            .run_streaming_visible_blocking("sh", &["-c", "echo visible; echo problem >&2"], None)
+            .unwrap();
+
+        assert!(output.stdout.contains("visible"));
+        assert!(output.stderr.contains("problem"));
     }
 }

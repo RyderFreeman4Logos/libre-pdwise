@@ -10,8 +10,8 @@ use anyhow::Context;
 use clap::Parser;
 use tracing::{error, info};
 
-use lpdwise_audio::MediaAcquirer;
 use lpdwise_asr::AsrEngine;
+use lpdwise_audio::MediaAcquirer;
 use lpdwise_device::DeviceProber;
 use lpdwise_process::CommandRunner;
 
@@ -52,8 +52,8 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
     }
 
     // -- Resolve input --
-    let source = input::resolve_input(cli.input.as_deref())
-        .context("failed to resolve input source")?;
+    let source =
+        input::resolve_input(cli.input.as_deref()).context("failed to resolve input source")?;
     info!(source = ?source, "input resolved");
 
     // -- Language selection --
@@ -64,8 +64,9 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
     };
 
     // -- Engine selection --
-    let device = lpdwise_device::LlmfitProber
-        .probe()
+    let device = tokio::task::spawn_blocking(|| lpdwise_device::LlmfitProber.probe())
+        .await
+        .context("device detection task failed")?
         .context("device detection failed")?;
 
     let groq_available = config.groq_api_key.is_some();
@@ -74,14 +75,9 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
     let engine_kind = match cli.engine {
         EngineArg::Auto => {
             if cli.non_interactive {
-                recommendations
-                    .first()
-                    .map(|r| r.engine)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no ASR engine available — check `lpdwise doctor`"
-                        )
-                    })?
+                recommendations.first().map(|r| r.engine).ok_or_else(|| {
+                    anyhow::anyhow!("no ASR engine available — check `lpdwise doctor`")
+                })?
             } else {
                 interactive::select_engine(&recommendations)
                     .context("engine selection cancelled")?
@@ -109,8 +105,7 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
     let acquire_spinner = create_spinner(Stage::Acquiring);
     let asset = match &source {
         lpdwise_core::InputSource::Url(_) => {
-            let acquirer =
-                lpdwise_audio::YtDlpAcquirer::new(config.media_dir.clone());
+            let acquirer = lpdwise_audio::YtDlpAcquirer::new(config.media_dir.clone());
             acquirer
                 .acquire(source.clone())
                 .await
@@ -127,10 +122,9 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
                 )
                 .with_extension("opus");
             let runner = CommandRunner::with_default_timeout();
-            let transcoded =
-                lpdwise_audio::transcode_to_opus(path, &opus_path, &runner)
-                    .await
-                    .context("audio transcoding failed")?;
+            let transcoded = lpdwise_audio::transcode_to_opus(path, &opus_path, &runner)
+                .await
+                .context("audio transcoding failed")?;
             transcoded
         }
     };
@@ -143,10 +137,7 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
         .await
         .context("silence detection failed")?;
 
-    let duration_ms = asset
-        .duration
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let duration_ms = asset.duration.map(|d| d.as_millis() as u64).unwrap_or(0);
     let size_bytes = asset.size_bytes.unwrap_or(0);
     let cut_points = lpdwise_audio::adaptive_chunk(&silences, duration_ms, size_bytes, 0);
 
@@ -161,31 +152,21 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
     } else {
         let chunk_dir = config.media_dir.join("chunks");
         std::fs::create_dir_all(&chunk_dir)?;
-        lpdwise_audio::split_audio(
-            &asset.path,
-            &cut_points,
-            &chunk_dir,
-            &runner,
-            duration_ms,
-        )
-        .await
-        .context("audio splitting failed")?
+        lpdwise_audio::split_audio(&asset.path, &cut_points, &chunk_dir, &runner, duration_ms)
+            .await
+            .context("audio splitting failed")?
     };
     finish_stage(&chunk_spinner, Stage::Chunking);
     info!(chunk_count = chunks.len(), "audio chunked");
 
     // -- Transcribe --
-    let transcribe_pb =
-        progress::create_progress_bar(chunks.len() as u64, Stage::Transcribing);
+    let transcribe_pb = progress::create_progress_bar(chunks.len() as u64, Stage::Transcribing);
     let mut all_segments = Vec::new();
 
     for chunk in &chunks {
-        let segments =
-            transcribe_chunk(engine_kind, chunk, &config)
-                .await
-                .with_context(|| {
-                    format!("transcription failed for chunk {}", chunk.index)
-                })?;
+        let segments = transcribe_chunk(engine_kind, chunk, &config)
+            .await
+            .with_context(|| format!("transcription failed for chunk {}", chunk.index))?;
         all_segments.extend(segments);
         transcribe_pb.inc(1);
     }
@@ -234,18 +215,12 @@ async fn transcribe_chunk(
 ) -> Result<Vec<lpdwise_core::TranscriptSegment>, AppError> {
     match engine {
         lpdwise_core::EngineKind::GroqWhisper => {
-            let api_key = config
-                .groq_api_key
-                .as_deref()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Groq API key not configured — set GROQ_API_KEY or config file"
-                    )
-                })?;
-            let transcript =
-                lpdwise_asr::transcribe_chunks(std::slice::from_ref(chunk), api_key)
-                    .await
-                    .context("Groq transcription failed")?;
+            let api_key = config.groq_api_key.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("Groq API key not configured — set GROQ_API_KEY or config file")
+            })?;
+            let transcript = lpdwise_asr::transcribe_chunks(std::slice::from_ref(chunk), api_key)
+                .await
+                .context("Groq transcription failed")?;
             Ok(transcript.segments)
         }
         lpdwise_core::EngineKind::SherpaOnnxSenseVoice
@@ -265,8 +240,7 @@ async fn transcribe_chunk(
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
