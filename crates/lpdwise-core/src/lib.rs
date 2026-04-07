@@ -7,9 +7,7 @@ pub mod prompt;
 pub mod types;
 
 pub use config::{load_config, AppConfig, ConfigError};
-pub use language::{
-    recommend_engines, EngineKind, EngineRecommendation, Language,
-};
+pub use language::{recommend_engines, EngineKind, EngineRecommendation, Language};
 pub use pipeline::{Pipeline, PipelineError};
 pub use prompt::PromptTemplate;
 pub use types::{
