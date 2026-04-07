@@ -144,6 +144,10 @@ mod tests {
         }
     }
 
+    fn temp_dir_in_tmp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     #[test]
     fn test_deliver_writes_to_clipboard() {
         let clipboard = MockClipboard::new();
@@ -160,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_deliver_with_archive() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = temp_dir_in_tmp();
         let archive_dir = tmp.path().join("archive");
 
         let clipboard = MockClipboard::new();
