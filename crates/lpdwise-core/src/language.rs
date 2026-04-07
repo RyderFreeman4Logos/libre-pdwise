@@ -61,8 +61,7 @@ pub fn recommend_engines(
                 recs.push(EngineRecommendation {
                     engine: EngineKind::SherpaOnnxSenseVoice,
                     priority: 1,
-                    reason: "SenseVoice is optimized for Chinese speech"
-                        .into(),
+                    reason: "SenseVoice is optimized for Chinese speech".into(),
                 });
             }
 
@@ -91,8 +90,7 @@ pub fn recommend_engines(
                 recs.push(EngineRecommendation {
                     engine: EngineKind::GroqWhisper,
                     priority: 1,
-                    reason: "Groq Whisper API is fastest for English/general"
-                        .into(),
+                    reason: "Groq Whisper API is fastest for English/general".into(),
                 });
             }
 
