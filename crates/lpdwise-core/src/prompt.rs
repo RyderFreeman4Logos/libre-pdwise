@@ -199,8 +199,7 @@ mod tests {
 
     #[test]
     fn test_render_standard_chinese_has_tail_instruction() {
-        let payload =
-            PromptTemplate::Standard.render(&sample_transcript(), Language::Chinese);
+        let payload = PromptTemplate::Standard.render(&sample_transcript(), Language::Chinese);
         assert!(payload.context.contains("中文"));
         assert!(payload.body.contains("Hello world"));
         assert!(payload.instruction.contains("结构化总结"));
@@ -209,37 +208,32 @@ mod tests {
 
     #[test]
     fn test_render_standard_english_uses_foreign_context() {
-        let payload =
-            PromptTemplate::Standard.render(&sample_transcript(), Language::English);
+        let payload = PromptTemplate::Standard.render(&sample_transcript(), Language::English);
         assert!(payload.context.contains("外语"));
         assert!(payload.instruction.contains("原语言"));
     }
 
     #[test]
     fn test_render_contrarian_contains_template() {
-        let payload =
-            PromptTemplate::Contrarian.render(&sample_transcript(), Language::Chinese);
+        let payload = PromptTemplate::Contrarian.render(&sample_transcript(), Language::Chinese);
         assert!(payload.instruction.contains("反常识"));
     }
 
     #[test]
     fn test_render_political_contains_template() {
-        let payload =
-            PromptTemplate::Political.render(&sample_transcript(), Language::Chinese);
+        let payload = PromptTemplate::Political.render(&sample_transcript(), Language::Chinese);
         assert!(payload.instruction.contains("博弈"));
     }
 
     #[test]
     fn test_render_translation_contains_template() {
-        let payload =
-            PromptTemplate::Translation.render(&sample_transcript(), Language::English);
+        let payload = PromptTemplate::Translation.render(&sample_transcript(), Language::English);
         assert!(payload.instruction.contains("翻译"));
     }
 
     #[test]
     fn test_assemble_ordering() {
-        let payload =
-            PromptTemplate::Standard.render(&sample_transcript(), Language::Chinese);
+        let payload = PromptTemplate::Standard.render(&sample_transcript(), Language::Chinese);
         let assembled = payload.assemble();
         let ctx_pos = assembled.find("中文").unwrap();
         let body_pos = assembled.find("Hello world").unwrap();
