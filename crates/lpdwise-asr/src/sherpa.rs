@@ -10,7 +10,8 @@ use crate::engine::{AsrEngine, AsrError};
 const SHERPA_CLI: &str = "sherpa-onnx-offline";
 
 /// Default HuggingFace model identifier for sherpa-onnx transducer.
-const DEFAULT_MODEL_NAME: &str = "csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20";
+const DEFAULT_MODEL_NAME: &str =
+    "csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20";
 
 /// ASR engine backed by sherpa-onnx for local on-device inference.
 ///
@@ -39,35 +40,65 @@ impl SherpaOnnxEngine {
 
         crate::model::download_model(DEFAULT_MODEL_NAME, &self.model_dir, None)
             .await
-            .map_err(|e| AsrError::ModelLoad(format!(
-                "failed to download model to {}: {e}",
-                self.model_dir.display()
-            )))?;
+            .map_err(|e| {
+                AsrError::ModelLoad(format!(
+                    "failed to download model to {}: {e}",
+                    self.model_dir.display()
+                ))
+            })?;
 
         Ok(())
     }
 
-    /// Check if the sherpa-onnx CLI is available on PATH.
-    async fn check_cli_available(&self) -> Result<(), AsrError> {
-        let result = self
-            .runner
-            .run_checked(SHERPA_CLI, &["--help"])
-            .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(ProcessError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(AsrError::NotAvailable(format!(
-                    "{SHERPA_CLI} not found. Install sherpa-onnx: \
-                     https://k2-fsa.github.io/sherpa/onnx/install.html"
-                )))
+    /// Check if the sherpa-onnx CLI is available on PATH or via mise, installing it globally if needed.
+    /// Returns the command and base arguments to use.
+    async fn resolve_cli(&self) -> Result<(String, Vec<String>), AsrError> {
+        let check_direct = || async {
+            let result = self.runner.run_checked(SHERPA_CLI, &["--help"]).await;
+            match result {
+                Ok(_) => true,
+                Err(ProcessError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(ProcessError::NonZeroExit { .. }) => true, // --help may exit non-zero
+                Err(_) => false,
             }
-            // --help may exit non-zero on some builds; that still means it's installed
-            Err(ProcessError::NonZeroExit { .. }) => Ok(()),
-            Err(e) => Err(AsrError::ApiRequest(format!(
-                "failed to check sherpa-onnx availability: {e}"
-            ))),
+        };
+
+        if check_direct().await {
+            return Ok((SHERPA_CLI.to_string(), vec![]));
         }
+
+        // Try installing globally via mise
+        debug!("sherpa-onnx not found, attempting to install via mise use -g...");
+        let install_result = self.runner.run_checked("mise", &["use", "-g", "github:k2-fsa/sherpa-onnx"]).await;
+        
+        if install_result.is_ok() {
+            debug!("sherpa-onnx successfully installed via mise");
+            if check_direct().await {
+                return Ok((SHERPA_CLI.to_string(), vec![]));
+            }
+
+            // Fallback to `mise exec` if the shim is not in PATH
+            let mise_args = vec!["exec".to_string(), "--".to_string(), SHERPA_CLI.to_string()];
+            let arg_refs: Vec<&str> = mise_args.iter().map(|s| s.as_str()).collect();
+            let exec_result = self.runner.run_checked("mise", &arg_refs).await;
+            
+            let mise_exec_found = match exec_result {
+                Ok(_) => true,
+                Err(ProcessError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(ProcessError::NonZeroExit { .. }) => true, // It ran but exited non-zero
+                Err(_) => false,
+            };
+
+            if mise_exec_found {
+                return Ok(("mise".to_string(), mise_args));
+            }
+        }
+
+        Err(AsrError::NotAvailable(format!(
+            "{SHERPA_CLI} not found, and `mise use -g` failed to install it. \
+             Please install sherpa-onnx manually: \
+             https://k2-fsa.github.io/sherpa/onnx/install.html"
+        )))
     }
 
     /// Find the encoder, decoder, joiner, and tokens files in model_dir.
@@ -130,16 +161,13 @@ struct SherpaModelFiles {
 
 impl AsrEngine for SherpaOnnxEngine {
     #[instrument(skip(self), fields(chunk_index = chunk.index, model_dir = %self.model_dir.display()))]
-    async fn transcribe(
-        &self,
-        chunk: &AudioChunk,
-    ) -> Result<Vec<TranscriptSegment>, AsrError> {
-        self.check_cli_available().await?;
+    async fn transcribe(&self, chunk: &AudioChunk) -> Result<Vec<TranscriptSegment>, AsrError> {
+        let (cmd, mut args) = self.resolve_cli().await?;
         self.ensure_model().await?;
 
         let model_files = self.find_model_files()?;
 
-        let args = vec![
+        args.extend(vec![
             "--encoder".to_string(),
             model_files.encoder.to_string_lossy().into_owned(),
             "--decoder".to_string(),
@@ -149,19 +177,17 @@ impl AsrEngine for SherpaOnnxEngine {
             "--tokens".to_string(),
             model_files.tokens.to_string_lossy().into_owned(),
             chunk.path.to_string_lossy().into_owned(),
-        ];
+        ]);
 
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let output = self
             .runner
-            .run_checked(SHERPA_CLI, &arg_refs)
+            .run_checked(&cmd, &arg_refs)
             .await
             .map_err(|e| match e {
                 ProcessError::Io(io) => AsrError::Io(io),
-                other => AsrError::ApiRequest(format!(
-                    "sherpa-onnx CLI failed: {other}"
-                )),
+                other => AsrError::ApiRequest(format!("sherpa-onnx CLI failed: {other}")),
             })?;
 
         // sherpa-onnx outputs the transcription text to stdout.

@@ -29,17 +29,46 @@ impl LlmfitProber {
 
     /// Try probing via `llmfit system --json` CLI.
     fn try_llmfit(&self) -> Option<DeviceCapabilities> {
-        let output = std::process::Command::new("llmfit")
-            .args(["system", "--json"])
-            .output()
-            .ok()?;
+        let run_cmd = || {
+            std::process::Command::new("llmfit")
+                .args(["system", "--json"])
+                .output()
+        };
+
+        let mut output = run_cmd();
+
+        if output.is_err() {
+            // Try to auto-install via mise if not found
+            debug!("llmfit not found, attempting to install via mise...");
+            let install_status = std::process::Command::new("mise")
+                .args(["use", "-g", "cargo:llmfit@latest"])
+                .status();
+
+            if let Ok(status) = install_status {
+                if status.success() {
+                    debug!("llmfit successfully installed via mise");
+                    // Try running again after installation
+                    output = run_cmd();
+                    
+                    // If llmfit is still not in PATH (shims not configured), try running it via mise exec
+                    if output.is_err() {
+                        output = std::process::Command::new("mise")
+                            .args(["exec", "--", "llmfit", "system", "--json"])
+                            .output();
+                    }
+                } else {
+                    warn!("failed to install llmfit via mise");
+                }
+            }
+        }
+
+        let output = output.ok()?;
 
         if !output.status.success() {
             return None;
         }
 
-        let parsed: LlmfitOutput =
-            serde_json::from_slice(&output.stdout).ok()?;
+        let parsed: LlmfitOutput = serde_json::from_slice(&output.stdout).ok()?;
 
         let acceleration = parsed
             .acceleration
@@ -112,12 +141,9 @@ fn probe_disk_free() -> u64 {
         use std::ffi::CString;
         use std::mem::MaybeUninit;
 
-        let path = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/"));
-        let c_path = CString::new(
-            path.to_string_lossy().as_bytes(),
-        )
-        .unwrap_or_else(|_| CString::new("/").unwrap());
+        let path = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let c_path = CString::new(path.to_string_lossy().as_bytes())
+            .unwrap_or_else(|_| CString::new("/").unwrap());
 
         let mut stat = MaybeUninit::<libc::statvfs>::uninit();
         // SAFETY: statvfs is a POSIX function that writes to the provided
