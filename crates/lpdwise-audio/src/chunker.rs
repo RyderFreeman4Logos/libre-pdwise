@@ -248,18 +248,23 @@ pub fn adaptive_chunk_with_policy(
         return Vec::new();
     }
 
-    let effective_max_duration_ms =
+    let safe_chunk_budget_ms =
         effective_max_chunk_duration_ms(total_duration_ms, total_size_bytes, policy);
-    if effective_max_duration_ms == 0 {
+    if safe_chunk_budget_ms == 0 {
         return Vec::new();
     }
 
-    if total_duration_ms <= effective_max_duration_ms
+    if total_duration_ms <= safe_chunk_budget_ms
         && (total_size_bytes == 0 || total_size_bytes <= policy.max_chunk_bytes)
     {
         return Vec::new();
     }
 
+    // Backward overlap is added during extraction for non-first chunks, so
+    // reserve that budget before choosing logical cut windows.
+    let effective_max_duration_ms = safe_chunk_budget_ms
+        .saturating_sub(policy.overlap_ms)
+        .max(1);
     let target_chunk_duration_ms = policy
         .target_chunk_duration_ms
         .min(effective_max_duration_ms);
@@ -322,6 +327,7 @@ pub fn adaptive_chunk_with_policy(
         cuts = cuts.len(),
         total_duration_ms,
         total_size_bytes,
+        safe_chunk_budget_ms,
         effective_max_duration_ms,
         "computed policy-based chunk cut points"
     );
@@ -680,7 +686,7 @@ mod tests {
 
         assert_eq!(cuts.len(), 2);
         assert_eq!(cuts[0].offset_ms, 300_000);
-        assert_eq!(cuts[1].offset_ms, 900_000);
+        assert_eq!(cuts[1].offset_ms, 890_000);
     }
 
     #[test]
@@ -707,6 +713,28 @@ mod tests {
 
         assert!(!cuts.is_empty());
         assert_eq!(cuts[0].offset_ms, 120_000);
+    }
+
+    #[test]
+    fn test_groq_policy_reserves_overlap_from_actual_extracted_duration() {
+        let policy = ChunkingPolicy::groq_whisper();
+        let cuts = adaptive_chunk_with_policy(&[], 1_200_000, 5 * 1024 * 1024, policy);
+        let chunks = plan_split_chunks(
+            Path::new("/tmp/source.opus"),
+            &cuts,
+            Path::new("/tmp/chunks"),
+            1_200_000,
+            policy.overlap_ms,
+        );
+
+        assert_eq!(cuts[0].offset_ms, 590_000);
+        assert!(
+            chunks.iter().all(|chunk| {
+                chunk.end.saturating_sub(chunk.audio_start).as_millis()
+                    <= u128::from(policy.max_chunk_duration_ms)
+            }),
+            "planned Groq chunks must stay within the provider duration budget"
+        );
     }
 
     // --- split_audio returns single chunk when no cuts ---
