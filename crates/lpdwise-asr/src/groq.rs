@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use bytes::Bytes;
 use lpdwise_core::types::{AudioChunk, Transcript, TranscriptSegment};
 use reqwest::header::RETRY_AFTER;
 use reqwest::multipart;
@@ -54,14 +55,15 @@ impl GroqWhisperEngine {
     /// Send a single audio file to the Groq Whisper API with retry on 429.
     #[instrument(skip(self, audio_path), fields(path = %audio_path.display()))]
     async fn call_api(&self, audio_path: &std::path::Path) -> Result<GroqResponse, AsrError> {
-        let file_bytes = tokio::fs::read(audio_path).await.map_err(AsrError::Io)?;
-        let file_size_bytes = file_bytes.len() as u64;
+        let raw_bytes = tokio::fs::read(audio_path).await.map_err(AsrError::Io)?;
+        let file_size_bytes = raw_bytes.len() as u64;
         if file_size_bytes > SAFE_MAX_UPLOAD_BYTES {
             return Err(AsrError::ApiRequest(format!(
                 "audio chunk exceeds Groq safe upload budget: {} bytes > {} bytes",
                 file_size_bytes, SAFE_MAX_UPLOAD_BYTES
             )));
         }
+        let file_bytes = Bytes::from(raw_bytes);
 
         let file_name = audio_path
             .file_name()
@@ -73,7 +75,7 @@ impl GroqWhisperEngine {
         let mut backoff = INITIAL_BACKOFF;
 
         for attempt in 0..=MAX_RETRIES {
-            let part = multipart::Part::bytes(file_bytes.clone())
+            let part = multipart::Part::stream(file_bytes.clone())
                 .file_name(file_name.clone())
                 .mime_str(mime)
                 .map_err(|e| AsrError::ApiRequest(e.to_string()))?;
@@ -329,6 +331,33 @@ mod tests {
 
         assert_eq!(existing.len(), 2);
         assert_eq!(existing[0].text, "earlier");
+        assert_eq!(existing[1].text, "later");
+    }
+
+    #[test]
+    fn test_merge_chunk_segments_keeps_cross_boundary_segments() {
+        let mut existing = vec![TranscriptSegment {
+            text: "cross-boundary".into(),
+            start: Duration::from_secs(85),
+            end: Duration::from_secs(91),
+        }];
+        let chunk = AudioChunk {
+            path: std::path::PathBuf::from("chunk.opus"),
+            index: 1,
+            audio_start: Duration::from_secs(90),
+            start: Duration::from_secs(100),
+            end: Duration::from_secs(180),
+        };
+        let next_segments = vec![TranscriptSegment {
+            text: "later".into(),
+            start: Duration::from_secs(92),
+            end: Duration::from_secs(110),
+        }];
+
+        merge_chunk_segments(&mut existing, &chunk, next_segments);
+
+        assert_eq!(existing.len(), 2);
+        assert_eq!(existing[0].text, "cross-boundary");
         assert_eq!(existing[1].text, "later");
     }
 
