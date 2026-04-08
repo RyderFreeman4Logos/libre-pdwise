@@ -24,6 +24,11 @@ pub struct MediaAsset {
 pub struct AudioChunk {
     pub path: PathBuf,
     pub index: usize,
+    /// Start offset of the extracted audio on the original timeline.
+    ///
+    /// This equals `start` for normal chunks and is earlier than `start`
+    /// when the chunk includes backward overlap for boundary recovery.
+    pub audio_start: Duration,
     pub start: Duration,
     pub end: Duration,
 }
