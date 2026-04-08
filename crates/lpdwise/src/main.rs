@@ -139,22 +139,46 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
 
     let duration_ms = asset.duration.map(|d| d.as_millis() as u64).unwrap_or(0);
     let size_bytes = asset.size_bytes.unwrap_or(0);
-    let cut_points = lpdwise_audio::adaptive_chunk(&silences, duration_ms, size_bytes, 0);
+    let groq_chunk_policy = lpdwise_audio::ChunkingPolicy::groq_whisper();
+    let cut_points = if matches!(engine_kind, lpdwise_core::EngineKind::GroqWhisper) {
+        lpdwise_audio::adaptive_chunk_with_policy(
+            &silences,
+            duration_ms,
+            size_bytes,
+            groq_chunk_policy,
+        )
+    } else {
+        lpdwise_audio::adaptive_chunk(&silences, duration_ms, size_bytes, 0)
+    };
 
     let chunks = if cut_points.is_empty() {
         // Single chunk — treat entire file as one chunk
         vec![lpdwise_core::AudioChunk {
             path: asset.path.clone(),
             index: 0,
+            audio_start: std::time::Duration::ZERO,
             start: std::time::Duration::ZERO,
             end: asset.duration.unwrap_or(std::time::Duration::ZERO),
         }]
     } else {
         let chunk_dir = config.media_dir.join("chunks");
         std::fs::create_dir_all(&chunk_dir)?;
-        lpdwise_audio::split_audio(&asset.path, &cut_points, &chunk_dir, &runner, duration_ms)
+        if matches!(engine_kind, lpdwise_core::EngineKind::GroqWhisper) {
+            lpdwise_audio::split_audio_with_overlap(
+                &asset.path,
+                &cut_points,
+                &chunk_dir,
+                &runner,
+                duration_ms,
+                groq_chunk_policy.overlap_ms,
+            )
             .await
             .context("audio splitting failed")?
+        } else {
+            lpdwise_audio::split_audio(&asset.path, &cut_points, &chunk_dir, &runner, duration_ms)
+                .await
+                .context("audio splitting failed")?
+        }
     };
     finish_stage(&chunk_spinner, Stage::Chunking);
     info!(chunk_count = chunks.len(), "audio chunked");
@@ -164,10 +188,10 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
     let mut all_segments = Vec::new();
 
     for chunk in &chunks {
-        let segments = transcribe_chunk(engine_kind, chunk, &config)
+        let segments = transcribe_chunk(engine_kind, chunk, &config, language)
             .await
             .with_context(|| format!("transcription failed for chunk {}", chunk.index))?;
-        all_segments.extend(segments);
+        lpdwise_asr::merge_chunk_segments(&mut all_segments, chunk, segments);
         transcribe_pb.inc(1);
     }
     finish_stage(&transcribe_pb, Stage::Transcribing);
@@ -212,15 +236,20 @@ async fn transcribe_chunk(
     engine: lpdwise_core::EngineKind,
     chunk: &lpdwise_core::AudioChunk,
     config: &lpdwise_core::AppConfig,
+    language: lpdwise_core::Language,
 ) -> Result<Vec<lpdwise_core::TranscriptSegment>, AppError> {
     match engine {
         lpdwise_core::EngineKind::GroqWhisper => {
             let api_key = config.groq_api_key.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("Groq API key not configured — set GROQ_API_KEY or config file")
             })?;
-            let transcript = lpdwise_asr::transcribe_chunks(std::slice::from_ref(chunk), api_key)
-                .await
-                .context("Groq transcription failed")?;
+            let transcript = lpdwise_asr::transcribe_chunks(
+                std::slice::from_ref(chunk),
+                api_key,
+                Some(language.bcp47_tag()),
+            )
+            .await
+            .context("Groq transcription failed")?;
             Ok(transcript.segments)
         }
         lpdwise_core::EngineKind::SherpaOnnxSenseVoice

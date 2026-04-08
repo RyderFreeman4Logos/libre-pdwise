@@ -7,8 +7,14 @@ use tracing::{debug, info, warn};
 use lpdwise_core::types::AudioChunk;
 use lpdwise_process::runner::{CommandRunner, ProcessRunner};
 
-/// Default maximum chunk size in bytes (25 MB, Groq Whisper API limit).
+/// Default maximum chunk size in bytes for legacy size-only chunking.
 const DEFAULT_MAX_CHUNK_BYTES: u64 = 25 * 1024 * 1024;
+/// Conservative Groq upload budget kept below the provider hard cap.
+const GROQ_SAFE_MAX_CHUNK_BYTES: u64 = 20 * 1024 * 1024;
+const GROQ_MAX_CHUNK_DURATION_MS: u64 = 10 * 60 * 1000;
+const GROQ_TARGET_CHUNK_DURATION_MS: u64 = 5 * 60 * 1000;
+const GROQ_MIN_CHUNK_DURATION_MS: u64 = 90 * 1000;
+const GROQ_OVERLAP_MS: u64 = 10 * 1000;
 
 /// A detected gap of silence in the audio stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +29,33 @@ pub struct SilenceGap {
 pub struct CutPoint {
     /// Millisecond offset where the cut should be made.
     pub offset_ms: u64,
+}
+
+/// Chunking knobs for engines that need tighter context control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkingPolicy {
+    pub max_chunk_bytes: u64,
+    pub max_chunk_duration_ms: u64,
+    pub target_chunk_duration_ms: u64,
+    pub min_chunk_duration_ms: u64,
+    pub overlap_ms: u64,
+}
+
+impl ChunkingPolicy {
+    /// Conservative Groq policy:
+    /// - 20 MiB safe upload budget
+    /// - 5 min target chunks
+    /// - 10 min hard ceiling
+    /// - 10 s backward overlap
+    pub const fn groq_whisper() -> Self {
+        Self {
+            max_chunk_bytes: GROQ_SAFE_MAX_CHUNK_BYTES,
+            max_chunk_duration_ms: GROQ_MAX_CHUNK_DURATION_MS,
+            target_chunk_duration_ms: GROQ_TARGET_CHUNK_DURATION_MS,
+            min_chunk_duration_ms: GROQ_MIN_CHUNK_DURATION_MS,
+            overlap_ms: GROQ_OVERLAP_MS,
+        }
+    }
 }
 
 /// Errors from audio chunking.
@@ -201,6 +234,107 @@ pub fn adaptive_chunk(
         .collect()
 }
 
+/// Compute cut points with both size and time constraints.
+///
+/// This is intended for cloud ASR backends where oversize chunks hurt both
+/// request success rate and recognition quality.
+pub fn adaptive_chunk_with_policy(
+    silences: &[SilenceGap],
+    total_duration_ms: u64,
+    total_size_bytes: u64,
+    policy: ChunkingPolicy,
+) -> Vec<CutPoint> {
+    if total_duration_ms == 0 {
+        return Vec::new();
+    }
+
+    let safe_chunk_budget_ms =
+        effective_max_chunk_duration_ms(total_duration_ms, total_size_bytes, policy);
+    if safe_chunk_budget_ms == 0 {
+        return Vec::new();
+    }
+
+    if total_duration_ms <= safe_chunk_budget_ms
+        && (total_size_bytes == 0 || total_size_bytes <= policy.max_chunk_bytes)
+    {
+        return Vec::new();
+    }
+
+    // Backward overlap is added during extraction for non-first chunks, so
+    // reserve that budget before choosing logical cut windows.
+    let effective_max_duration_ms = safe_chunk_budget_ms
+        .saturating_sub(policy.overlap_ms)
+        .max(1);
+    let target_chunk_duration_ms = policy
+        .target_chunk_duration_ms
+        .min(effective_max_duration_ms);
+    let min_chunk_duration_ms = policy
+        .min_chunk_duration_ms
+        .min(target_chunk_duration_ms)
+        .min(effective_max_duration_ms);
+
+    let mut cuts = Vec::new();
+    let mut pos_ms = 0;
+
+    while pos_ms + min_chunk_duration_ms < total_duration_ms {
+        let remaining_ms = total_duration_ms.saturating_sub(pos_ms);
+        if remaining_ms <= effective_max_duration_ms {
+            break;
+        }
+
+        let window_end_ms = (pos_ms + effective_max_duration_ms).min(total_duration_ms);
+        let min_cut_ms = pos_ms + min_chunk_duration_ms;
+
+        let candidates = silence_candidates(silences, min_cut_ms, window_end_ms);
+        let fallback_candidates = silence_candidates(silences, pos_ms, window_end_ms);
+
+        let best = candidates
+            .iter()
+            .max_by(|left, right| {
+                score_gap(left, pos_ms, target_chunk_duration_ms).total_cmp(&score_gap(
+                    right,
+                    pos_ms,
+                    target_chunk_duration_ms,
+                ))
+            })
+            .or_else(|| {
+                fallback_candidates.iter().max_by(|left, right| {
+                    score_gap(left, pos_ms, target_chunk_duration_ms).total_cmp(&score_gap(
+                        right,
+                        pos_ms,
+                        target_chunk_duration_ms,
+                    ))
+                })
+            });
+
+        let cut_ms = match best {
+            Some(gap) => gap.start_ms + gap.duration_ms / 2,
+            None => window_end_ms,
+        };
+
+        let cut_ms = cut_ms.clamp(
+            pos_ms.saturating_add(1),
+            total_duration_ms.saturating_sub(1),
+        );
+        cuts.push(CutPoint { offset_ms: cut_ms });
+        pos_ms = cut_ms;
+    }
+
+    cuts.dedup_by_key(|cut| cut.offset_ms);
+    cuts.retain(|cut| cut.offset_ms > 0 && cut.offset_ms < total_duration_ms);
+
+    info!(
+        cuts = cuts.len(),
+        total_duration_ms,
+        total_size_bytes,
+        safe_chunk_budget_ms,
+        effective_max_duration_ms,
+        "computed policy-based chunk cut points"
+    );
+
+    cuts
+}
+
 // ---------------------------------------------------------------------------
 // 3-3: ffmpeg split execution
 // ---------------------------------------------------------------------------
@@ -216,6 +350,27 @@ pub async fn split_audio(
     runner: &CommandRunner,
     total_duration_ms: u64,
 ) -> Result<Vec<AudioChunk>, ChunkerError> {
+    split_audio_with_overlap(
+        audio_path,
+        cut_points,
+        output_dir,
+        runner,
+        total_duration_ms,
+        0,
+    )
+    .await
+}
+
+/// Split an audio file at the given cut points, adding backward overlap to
+/// chunks after the first.
+pub async fn split_audio_with_overlap(
+    audio_path: &Path,
+    cut_points: &[CutPoint],
+    output_dir: &Path,
+    runner: &CommandRunner,
+    total_duration_ms: u64,
+    overlap_ms: u64,
+) -> Result<Vec<AudioChunk>, ChunkerError> {
     if total_duration_ms == 0 {
         return Err(ChunkerError::EmptyAudio);
     }
@@ -225,44 +380,33 @@ pub async fn split_audio(
         return Ok(vec![AudioChunk {
             path: audio_path.to_path_buf(),
             index: 0,
+            audio_start: Duration::ZERO,
             start: Duration::ZERO,
             end: Duration::from_millis(total_duration_ms),
         }]);
     }
 
-    let stem = audio_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("chunk");
-    let ext = audio_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("opus");
+    let chunk_plan = plan_split_chunks(
+        audio_path,
+        cut_points,
+        output_dir,
+        total_duration_ms,
+        overlap_ms,
+    );
+    let mut chunks = Vec::with_capacity(chunk_plan.len());
 
-    let mut boundaries: Vec<u64> = Vec::with_capacity(cut_points.len() + 2);
-    boundaries.push(0);
-    for cp in cut_points {
-        boundaries.push(cp.offset_ms);
-    }
-    boundaries.push(total_duration_ms);
-
-    let mut chunks = Vec::with_capacity(boundaries.len() - 1);
-
-    for (i, window) in boundaries.windows(2).enumerate() {
-        let start_ms = window[0];
-        let end_ms = window[1];
-
-        let chunk_path = output_dir.join(format!("{stem}_{i:04}.{ext}"));
+    for chunk in chunk_plan {
         let input_str = audio_path.to_string_lossy();
-        let output_str = chunk_path.to_string_lossy();
+        let output_str = chunk.path.to_string_lossy();
 
-        let start_secs = format!("{:.3}", start_ms as f64 / 1000.0);
-        let end_secs = format!("{:.3}", end_ms as f64 / 1000.0);
+        let start_secs = format!("{:.3}", chunk.audio_start.as_secs_f64());
+        let end_secs = format!("{:.3}", chunk.end.as_secs_f64());
 
         info!(
-            index = i,
-            start_ms,
-            end_ms,
+            index = chunk.index,
+            audio_start_ms = chunk.audio_start.as_millis(),
+            start_ms = chunk.start.as_millis(),
+            end_ms = chunk.end.as_millis(),
             output = %output_str,
             "splitting audio chunk"
         );
@@ -285,21 +429,16 @@ pub async fn split_audio(
                 None,
             )
             .await
-            .map_err(|e| ChunkerError::SplitFailed(format!("chunk {i}: {e}")))?;
+            .map_err(|e| ChunkerError::SplitFailed(format!("chunk {}: {e}", chunk.index)))?;
 
-        if !chunk_path.exists() {
+        if !chunk.path.exists() {
             warn!(path = %output_str, "expected chunk file not found after ffmpeg");
             return Err(ChunkerError::SplitFailed(format!(
                 "output file missing: {output_str}"
             )));
         }
 
-        chunks.push(AudioChunk {
-            path: chunk_path,
-            index: i,
-            start: Duration::from_millis(start_ms),
-            end: Duration::from_millis(end_ms),
-        });
+        chunks.push(chunk);
     }
 
     Ok(chunks)
@@ -311,6 +450,99 @@ pub async fn split_audio(
 
 fn seconds_to_ms(secs: f64) -> u64 {
     (secs * 1000.0).round() as u64
+}
+
+fn effective_max_chunk_duration_ms(
+    total_duration_ms: u64,
+    total_size_bytes: u64,
+    policy: ChunkingPolicy,
+) -> u64 {
+    let size_bound_ms = if total_size_bytes == 0 || total_size_bytes <= policy.max_chunk_bytes {
+        total_duration_ms
+    } else {
+        let scaled = (u128::from(total_duration_ms) * u128::from(policy.max_chunk_bytes))
+            / u128::from(total_size_bytes);
+        scaled.max(1).min(u128::from(u64::MAX)) as u64
+    };
+
+    policy
+        .max_chunk_duration_ms
+        .min(size_bound_ms)
+        .min(total_duration_ms)
+}
+
+fn silence_candidates(
+    silences: &[SilenceGap],
+    window_start_ms: u64,
+    window_end_ms: u64,
+) -> Vec<&SilenceGap> {
+    silences
+        .iter()
+        .filter(|gap| gap.start_ms >= window_start_ms && gap.end_ms <= window_end_ms)
+        .collect()
+}
+
+fn score_gap(gap: &SilenceGap, pos_ms: u64, target_chunk_duration_ms: u64) -> f64 {
+    let midpoint_ms = gap.start_ms as f64 + gap.duration_ms as f64 / 2.0;
+    let chunk_len_ms = midpoint_ms - pos_ms as f64;
+    let mut quality = (1.0 + gap.duration_ms as f64 / 1000.0).ln();
+    if gap.duration_ms >= 2_000 {
+        quality *= 1.5;
+    }
+
+    let sigma = (target_chunk_duration_ms as f64 * 0.4).max(1.0);
+    let distance = (chunk_len_ms - target_chunk_duration_ms as f64).abs();
+    let proximity = (-0.5 * (distance / sigma).powi(2)).exp();
+
+    quality * proximity
+}
+
+fn plan_split_chunks(
+    audio_path: &Path,
+    cut_points: &[CutPoint],
+    output_dir: &Path,
+    total_duration_ms: u64,
+    overlap_ms: u64,
+) -> Vec<AudioChunk> {
+    let stem = audio_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("chunk");
+    let ext = audio_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("opus");
+
+    let mut boundaries: Vec<u64> = Vec::with_capacity(cut_points.len() + 2);
+    boundaries.push(0);
+    for cp in cut_points {
+        boundaries.push(cp.offset_ms);
+    }
+    boundaries.push(total_duration_ms);
+
+    let mut chunks = Vec::with_capacity(boundaries.len().saturating_sub(1));
+
+    for (index, window) in boundaries.windows(2).enumerate() {
+        let start_ms = window[0];
+        let end_ms = window[1];
+        let chunk_duration_ms = end_ms.saturating_sub(start_ms);
+        let backward_overlap_ms = if index == 0 || overlap_ms == 0 {
+            0
+        } else {
+            overlap_ms.min(chunk_duration_ms / 3).min(start_ms)
+        };
+        let audio_start_ms = start_ms.saturating_sub(backward_overlap_ms);
+
+        chunks.push(AudioChunk {
+            path: output_dir.join(format!("{stem}_{index:04}.{ext}")),
+            index,
+            audio_start: Duration::from_millis(audio_start_ms),
+            start: Duration::from_millis(start_ms),
+            end: Duration::from_millis(end_ms),
+        });
+    }
+
+    chunks
 }
 
 /// Integer ceiling division.
@@ -430,6 +662,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_policy_chunking_limits_duration_even_when_file_is_small() {
+        let silences = vec![
+            SilenceGap {
+                start_ms: 295_000,
+                end_ms: 305_000,
+                duration_ms: 10_000,
+            },
+            SilenceGap {
+                start_ms: 895_000,
+                end_ms: 905_000,
+                duration_ms: 10_000,
+            },
+        ];
+
+        let cuts = adaptive_chunk_with_policy(
+            &silences,
+            1_200_000,
+            5 * 1024 * 1024,
+            ChunkingPolicy::groq_whisper(),
+        );
+
+        assert_eq!(cuts.len(), 2);
+        assert_eq!(cuts[0].offset_ms, 300_000);
+        assert_eq!(cuts[1].offset_ms, 890_000);
+    }
+
+    #[test]
+    fn test_policy_chunking_uses_size_bound_when_bitrate_is_high() {
+        let silences = vec![
+            SilenceGap {
+                start_ms: 110_000,
+                end_ms: 130_000,
+                duration_ms: 20_000,
+            },
+            SilenceGap {
+                start_ms: 260_000,
+                end_ms: 270_000,
+                duration_ms: 10_000,
+            },
+        ];
+
+        let cuts = adaptive_chunk_with_policy(
+            &silences,
+            600_000,
+            80 * 1024 * 1024,
+            ChunkingPolicy::groq_whisper(),
+        );
+
+        assert!(!cuts.is_empty());
+        assert_eq!(cuts[0].offset_ms, 120_000);
+    }
+
+    #[test]
+    fn test_groq_policy_reserves_overlap_from_actual_extracted_duration() {
+        let policy = ChunkingPolicy::groq_whisper();
+        let cuts = adaptive_chunk_with_policy(&[], 1_200_000, 5 * 1024 * 1024, policy);
+        let chunks = plan_split_chunks(
+            Path::new("/tmp/source.opus"),
+            &cuts,
+            Path::new("/tmp/chunks"),
+            1_200_000,
+            policy.overlap_ms,
+        );
+
+        assert_eq!(cuts[0].offset_ms, 590_000);
+        assert!(
+            chunks.iter().all(|chunk| {
+                chunk.end.saturating_sub(chunk.audio_start).as_millis()
+                    <= u128::from(policy.max_chunk_duration_ms)
+            }),
+            "planned Groq chunks must stay within the provider duration budget"
+        );
+    }
+
     // --- split_audio returns single chunk when no cuts ---
 
     #[tokio::test]
@@ -445,6 +752,7 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].index, 0);
+        assert_eq!(result[0].audio_start, Duration::ZERO);
         assert_eq!(result[0].start, Duration::ZERO);
         assert_eq!(result[0].end, Duration::from_millis(60_000));
         assert_eq!(result[0].path, fake_audio);
@@ -460,6 +768,24 @@ mod tests {
         let result = split_audio(&fake_audio, &[], tmp.path(), &runner, 0).await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_plan_split_chunks_applies_backward_overlap() {
+        let audio_path = Path::new("/tmp/source.opus");
+        let output_dir = Path::new("/tmp/chunks");
+        let cut_points = vec![CutPoint { offset_ms: 120_000 }];
+
+        let chunks = plan_split_chunks(audio_path, &cut_points, output_dir, 300_000, 10_000);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].audio_start, Duration::ZERO);
+        assert_eq!(chunks[0].start, Duration::ZERO);
+        assert_eq!(chunks[0].end, Duration::from_millis(120_000));
+
+        assert_eq!(chunks[1].audio_start, Duration::from_millis(110_000));
+        assert_eq!(chunks[1].start, Duration::from_millis(120_000));
+        assert_eq!(chunks[1].end, Duration::from_millis(300_000));
     }
 
     // --- helpers ---
