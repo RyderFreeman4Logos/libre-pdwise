@@ -455,14 +455,17 @@ fn normalize_segment_text(text: &str) -> String {
     normalize_words(text).join(" ")
 }
 
+fn normalize_token(token: &str) -> String {
+    token
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_alphanumeric())
+        .collect::<String>()
+}
+
 fn normalize_words(text: &str) -> Vec<String> {
     text.split_whitespace()
-        .map(|word| {
-            word.chars()
-                .flat_map(char::to_lowercase)
-                .filter(|ch| ch.is_alphanumeric())
-                .collect::<String>()
-        })
+        .map(normalize_token)
         .filter(|word| !word.is_empty())
         .collect()
 }
@@ -543,21 +546,31 @@ fn trim_leading_words(text: &str, words_to_trim: usize) -> String {
         return text.trim().to_string();
     }
 
-    let mut skipped_words = 0usize;
-    let mut in_word = false;
+    let mut removed_words = 0usize;
+    let mut token_start = None;
 
     for (idx, ch) in text.char_indices() {
         if ch.is_whitespace() {
-            in_word = false;
+            if let Some(start) = token_start.take() {
+                let token = &text[start..idx];
+                if !normalize_token(token).is_empty() {
+                    removed_words += 1;
+                }
+            }
             continue;
         }
 
-        if !in_word {
-            if skipped_words == words_to_trim {
+        if token_start.is_none() {
+            if removed_words >= words_to_trim {
                 return text[idx..].trim().to_string();
             }
-            skipped_words += 1;
-            in_word = true;
+            token_start = Some(idx);
+        }
+    }
+
+    if let Some(start) = token_start {
+        if removed_words >= words_to_trim {
+            return text[start..].trim().to_string();
         }
     }
 
@@ -752,6 +765,13 @@ mod tests {
         let clipped = clip_to_last_chars("alpha beta gamma", 9);
 
         assert_eq!(clipped, "gamma");
+    }
+
+    #[test]
+    fn test_trim_leading_words_ignores_punctuation_only_prefix_tokens() {
+        let trimmed = trim_leading_words("... hello world", 1);
+
+        assert_eq!(trimmed, "world");
     }
 
     #[test]
