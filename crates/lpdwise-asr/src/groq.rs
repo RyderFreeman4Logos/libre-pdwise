@@ -15,6 +15,31 @@ const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const SAFE_MAX_UPLOAD_BYTES: u64 = 20 * 1024 * 1024;
 const SAFE_MAX_CHUNK_DURATION: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_PROMPT_MAX_CHARS: usize = 256;
+const PROMPT_TAIL_SEGMENTS: usize = 6;
+const MAX_STITCH_SEGMENTS: usize = 6;
+const MAX_STITCH_WORDS: usize = 24;
+const MIN_STITCH_WORD_OVERLAP: usize = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroqTranscriptionOptions {
+    pub language: Option<String>,
+    pub prompt_max_chars: usize,
+}
+
+impl GroqTranscriptionOptions {
+    pub fn new(language: Option<&str>) -> Self {
+        Self {
+            language: normalize_language(language),
+            prompt_max_chars: DEFAULT_PROMPT_MAX_CHARS,
+        }
+    }
+
+    pub fn with_prompt_max_chars(mut self, prompt_max_chars: usize) -> Self {
+        self.prompt_max_chars = prompt_max_chars;
+        self
+    }
+}
 
 /// ASR engine backed by the Groq Whisper API.
 pub struct GroqWhisperEngine {
@@ -53,8 +78,12 @@ impl GroqWhisperEngine {
     }
 
     /// Send a single audio file to the Groq Whisper API with retry on 429.
-    #[instrument(skip(self, audio_path), fields(path = %audio_path.display()))]
-    async fn call_api(&self, audio_path: &std::path::Path) -> Result<GroqResponse, AsrError> {
+    #[instrument(skip(self, audio_path, prompt), fields(path = %audio_path.display()))]
+    async fn call_api(
+        &self,
+        audio_path: &std::path::Path,
+        prompt: Option<&str>,
+    ) -> Result<GroqResponse, AsrError> {
         let raw_bytes = tokio::fs::read(audio_path).await.map_err(AsrError::Io)?;
         let file_size_bytes = raw_bytes.len() as u64;
         if file_size_bytes > SAFE_MAX_UPLOAD_BYTES {
@@ -86,6 +115,9 @@ impl GroqWhisperEngine {
                 .text("response_format", "verbose_json");
             if let Some(language) = &self.language {
                 form = form.text("language", language.clone());
+            }
+            if let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) {
+                form = form.text("prompt", prompt.to_string());
             }
 
             let response = self
@@ -138,11 +170,13 @@ impl GroqWhisperEngine {
             "exhausted retries without success".into(),
         ))
     }
-}
 
-impl AsrEngine for GroqWhisperEngine {
-    #[instrument(skip(self), fields(chunk_index = chunk.index))]
-    async fn transcribe(&self, chunk: &AudioChunk) -> Result<Vec<TranscriptSegment>, AsrError> {
+    #[instrument(skip(self, prompt), fields(chunk_index = chunk.index))]
+    async fn transcribe_with_prompt(
+        &self,
+        chunk: &AudioChunk,
+        prompt: Option<&str>,
+    ) -> Result<Vec<TranscriptSegment>, AsrError> {
         let extracted_duration = chunk.end.saturating_sub(chunk.audio_start);
         if extracted_duration > SAFE_MAX_CHUNK_DURATION {
             return Err(AsrError::ApiRequest(format!(
@@ -151,7 +185,7 @@ impl AsrEngine for GroqWhisperEngine {
             )));
         }
 
-        let response = self.call_api(&chunk.path).await?;
+        let response = self.call_api(&chunk.path, prompt).await?;
 
         let segments = match response.segments {
             Some(segs) => segs
@@ -181,6 +215,13 @@ impl AsrEngine for GroqWhisperEngine {
     }
 }
 
+impl AsrEngine for GroqWhisperEngine {
+    #[instrument(skip(self), fields(chunk_index = chunk.index))]
+    async fn transcribe(&self, chunk: &AudioChunk) -> Result<Vec<TranscriptSegment>, AsrError> {
+        self.transcribe_with_prompt(chunk, None).await
+    }
+}
+
 /// Transcribe multiple chunks sequentially, adjusting timestamps by chunk offset.
 /// Returns a complete `Transcript` assembled from all chunks.
 #[instrument(skip_all, fields(chunk_count = chunks.len()))]
@@ -189,11 +230,29 @@ pub async fn transcribe_chunks(
     api_key: &str,
     language: Option<&str>,
 ) -> Result<Transcript, AsrError> {
-    let engine = GroqWhisperEngine::with_language(api_key.to_string(), language);
+    transcribe_chunks_with_options(chunks, api_key, GroqTranscriptionOptions::new(language)).await
+}
+
+/// Transcribe multiple chunks sequentially with Groq-specific quality options.
+#[instrument(skip_all, fields(chunk_count = chunks.len()))]
+pub async fn transcribe_chunks_with_options(
+    chunks: &[AudioChunk],
+    api_key: &str,
+    options: GroqTranscriptionOptions,
+) -> Result<Transcript, AsrError> {
+    let engine = GroqWhisperEngine::with_language(api_key.to_string(), options.language.as_deref());
     let mut all_segments = Vec::new();
 
     for chunk in chunks {
-        let segments = engine.transcribe(chunk).await?;
+        let prompt = build_conditioning_prompt(&all_segments, chunk, options.prompt_max_chars);
+        debug!(
+            chunk_index = chunk.index,
+            prompt_chars = prompt.as_ref().map_or(0, |value| value.chars().count()),
+            "transcribing Groq chunk with sequential context"
+        );
+        let segments = engine
+            .transcribe_with_prompt(chunk, prompt.as_deref())
+            .await?;
         merge_chunk_segments(&mut all_segments, chunk, segments);
     }
 
@@ -211,10 +270,8 @@ pub fn merge_chunk_segments(
         return;
     }
 
-    if chunk.audio_start < chunk.start {
-        all_segments.retain(|segment| segment.start < chunk.audio_start);
-    }
-    all_segments.extend(segments);
+    let stitched_segments = stitch_overlap_segments(all_segments, chunk, segments);
+    all_segments.extend(stitched_segments);
 }
 
 fn normalize_language(language: Option<&str>) -> Option<String> {
@@ -249,6 +306,253 @@ fn response_error_retry_delay(value: &reqwest::header::HeaderValue) -> Option<Du
         .ok()
         .and_then(|header| header.parse::<u64>().ok())
         .map(Duration::from_secs)
+}
+
+fn build_conditioning_prompt(
+    all_segments: &[TranscriptSegment],
+    chunk: &AudioChunk,
+    prompt_max_chars: usize,
+) -> Option<String> {
+    if prompt_max_chars == 0 {
+        return None;
+    }
+
+    let prompt_text = all_segments
+        .iter()
+        .rev()
+        .filter(|segment| segment.start < chunk.start)
+        .take(PROMPT_TAIL_SEGMENTS)
+        .map(|segment| segment.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+
+    if prompt_text.is_empty() {
+        return None;
+    }
+
+    let mut joined = prompt_text.into_iter().rev().collect::<Vec<_>>().join(" ");
+    joined = clip_to_last_chars(&joined, prompt_max_chars);
+    (!joined.is_empty()).then_some(joined)
+}
+
+fn stitch_overlap_segments(
+    all_segments: &[TranscriptSegment],
+    chunk: &AudioChunk,
+    segments: Vec<TranscriptSegment>,
+) -> Vec<TranscriptSegment> {
+    if chunk.audio_start >= chunk.start || all_segments.is_empty() {
+        return segments;
+    }
+
+    let overlap_segments = all_segments
+        .iter()
+        .filter(|segment| segment.end > chunk.audio_start)
+        .rev()
+        .take(MAX_STITCH_SEGMENTS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+
+    if overlap_segments.is_empty() {
+        return segments;
+    }
+
+    let segments = drop_exact_duplicate_prefix_segments(&overlap_segments, segments);
+    trim_duplicate_prefix_words(&overlap_segments, chunk, segments)
+}
+
+fn drop_exact_duplicate_prefix_segments(
+    overlap_segments: &[&TranscriptSegment],
+    segments: Vec<TranscriptSegment>,
+) -> Vec<TranscriptSegment> {
+    let max_overlap = overlap_segments
+        .len()
+        .min(segments.len())
+        .min(MAX_STITCH_SEGMENTS);
+    let duplicate_segments = (1..=max_overlap)
+        .rev()
+        .find(|candidate_len| {
+            overlap_segments[overlap_segments.len() - candidate_len..]
+                .iter()
+                .zip(segments.iter().take(*candidate_len))
+                .all(|(left, right)| {
+                    normalize_segment_text(&left.text) == normalize_segment_text(&right.text)
+                })
+        })
+        .unwrap_or(0);
+
+    segments.into_iter().skip(duplicate_segments).collect()
+}
+
+fn trim_duplicate_prefix_words(
+    overlap_segments: &[&TranscriptSegment],
+    chunk: &AudioChunk,
+    segments: Vec<TranscriptSegment>,
+) -> Vec<TranscriptSegment> {
+    if segments.is_empty() {
+        return segments;
+    }
+
+    let overlap_duration = chunk.start.saturating_sub(chunk.audio_start);
+    if overlap_duration.is_zero() {
+        return segments;
+    }
+
+    let boundary_limit = chunk.start + overlap_duration;
+    let left_words = trailing_words(overlap_segments, MAX_STITCH_WORDS);
+    let right_words = leading_words(
+        segments
+            .iter()
+            .take_while(|segment| segment.start < boundary_limit),
+        MAX_STITCH_WORDS,
+    );
+    let overlap_words = longest_word_overlap(&left_words, &right_words);
+    if overlap_words < MIN_STITCH_WORD_OVERLAP {
+        return segments;
+    }
+
+    trim_leading_words_from_segments(segments, overlap_words)
+}
+
+fn clip_to_last_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return text.trim().to_string();
+    }
+
+    let clipped = text
+        .chars()
+        .skip(total_chars.saturating_sub(max_chars))
+        .collect::<String>();
+    if let Some(boundary) = clipped.find(char::is_whitespace) {
+        let trimmed = clipped[boundary..].trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    clipped.trim().to_string()
+}
+
+fn normalize_segment_text(text: &str) -> String {
+    normalize_words(text).join(" ")
+}
+
+fn normalize_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .flat_map(char::to_lowercase)
+                .filter(|ch| ch.is_alphanumeric())
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn trailing_words(segments: &[&TranscriptSegment], max_words: usize) -> Vec<String> {
+    let mut words = Vec::new();
+
+    for segment in segments.iter().rev() {
+        let segment_words = normalize_words(&segment.text);
+        for word in segment_words.into_iter().rev() {
+            words.push(word);
+            if words.len() == max_words {
+                words.reverse();
+                return words;
+            }
+        }
+    }
+
+    words.reverse();
+    words
+}
+
+fn leading_words<'a>(
+    segments: impl Iterator<Item = &'a TranscriptSegment>,
+    max_words: usize,
+) -> Vec<String> {
+    let mut words = Vec::new();
+
+    for segment in segments {
+        for word in normalize_words(&segment.text) {
+            words.push(word);
+            if words.len() == max_words {
+                return words;
+            }
+        }
+    }
+
+    words
+}
+
+fn longest_word_overlap(left: &[String], right: &[String]) -> usize {
+    let max_overlap = left.len().min(right.len()).min(MAX_STITCH_WORDS);
+    (MIN_STITCH_WORD_OVERLAP..=max_overlap)
+        .rev()
+        .find(|candidate_len| left[left.len() - candidate_len..] == right[..*candidate_len])
+        .unwrap_or(0)
+}
+
+fn trim_leading_words_from_segments(
+    segments: Vec<TranscriptSegment>,
+    mut words_to_trim: usize,
+) -> Vec<TranscriptSegment> {
+    let mut trimmed_segments = Vec::with_capacity(segments.len());
+
+    for mut segment in segments {
+        if words_to_trim == 0 {
+            trimmed_segments.push(segment);
+            continue;
+        }
+
+        let trimmed_text = trim_leading_words(&segment.text, words_to_trim);
+        let removed_words = count_words(&segment.text).saturating_sub(count_words(&trimmed_text));
+        words_to_trim = words_to_trim.saturating_sub(removed_words);
+
+        if trimmed_text.is_empty() {
+            continue;
+        }
+
+        segment.text = trimmed_text;
+        trimmed_segments.push(segment);
+    }
+
+    trimmed_segments
+}
+
+fn trim_leading_words(text: &str, words_to_trim: usize) -> String {
+    if words_to_trim == 0 {
+        return text.trim().to_string();
+    }
+
+    let mut skipped_words = 0usize;
+    let mut in_word = false;
+
+    for (idx, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            in_word = false;
+            continue;
+        }
+
+        if !in_word {
+            if skipped_words == words_to_trim {
+                return text[idx..].trim().to_string();
+            }
+            skipped_words += 1;
+            in_word = true;
+        }
+    }
+
+    String::new()
+}
+
+fn count_words(text: &str) -> usize {
+    normalize_words(text).len()
 }
 
 #[cfg(test)]
@@ -301,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_chunk_segments_prefers_later_overlap() {
+    fn test_merge_chunk_segments_drops_exact_duplicate_overlap_prefix() {
         let mut existing = vec![
             TranscriptSegment {
                 text: "earlier".into(),
@@ -309,7 +613,7 @@ mod tests {
                 end: Duration::from_secs(95),
             },
             TranscriptSegment {
-                text: "overlap".into(),
+                text: "brown fox".into(),
                 start: Duration::from_secs(95),
                 end: Duration::from_secs(105),
             },
@@ -321,8 +625,43 @@ mod tests {
             start: Duration::from_secs(100),
             end: Duration::from_secs(180),
         };
+        let next_segments = vec![
+            TranscriptSegment {
+                text: "brown fox".into(),
+                start: Duration::from_secs(92),
+                end: Duration::from_secs(103),
+            },
+            TranscriptSegment {
+                text: "jumps".into(),
+                start: Duration::from_secs(103),
+                end: Duration::from_secs(110),
+            },
+        ];
+
+        merge_chunk_segments(&mut existing, &chunk, next_segments);
+
+        assert_eq!(existing.len(), 3);
+        assert_eq!(existing[0].text, "earlier");
+        assert_eq!(existing[1].text, "brown fox");
+        assert_eq!(existing[2].text, "jumps");
+    }
+
+    #[test]
+    fn test_merge_chunk_segments_trims_partial_overlap_words() {
+        let mut existing = vec![TranscriptSegment {
+            text: "brown fox jumps".into(),
+            start: Duration::from_secs(95),
+            end: Duration::from_secs(105),
+        }];
+        let chunk = AudioChunk {
+            path: std::path::PathBuf::from("chunk.opus"),
+            index: 1,
+            audio_start: Duration::from_secs(90),
+            start: Duration::from_secs(100),
+            end: Duration::from_secs(180),
+        };
         let next_segments = vec![TranscriptSegment {
-            text: "later".into(),
+            text: "fox jumps high".into(),
             start: Duration::from_secs(92),
             end: Duration::from_secs(110),
         }];
@@ -330,16 +669,16 @@ mod tests {
         merge_chunk_segments(&mut existing, &chunk, next_segments);
 
         assert_eq!(existing.len(), 2);
-        assert_eq!(existing[0].text, "earlier");
-        assert_eq!(existing[1].text, "later");
+        assert_eq!(existing[0].text, "brown fox jumps");
+        assert_eq!(existing[1].text, "high");
     }
 
     #[test]
-    fn test_merge_chunk_segments_keeps_cross_boundary_segments() {
+    fn test_merge_chunk_segments_keeps_existing_overlap_when_new_chunk_is_distinct() {
         let mut existing = vec![TranscriptSegment {
             text: "cross-boundary".into(),
             start: Duration::from_secs(85),
-            end: Duration::from_secs(91),
+            end: Duration::from_secs(101),
         }];
         let chunk = AudioChunk {
             path: std::path::PathBuf::from("chunk.opus"),
@@ -350,7 +689,7 @@ mod tests {
         };
         let next_segments = vec![TranscriptSegment {
             text: "later".into(),
-            start: Duration::from_secs(92),
+            start: Duration::from_secs(102),
             end: Duration::from_secs(110),
         }];
 
@@ -359,6 +698,33 @@ mod tests {
         assert_eq!(existing.len(), 2);
         assert_eq!(existing[0].text, "cross-boundary");
         assert_eq!(existing[1].text, "later");
+    }
+
+    #[test]
+    fn test_build_conditioning_prompt_uses_recent_tail_text() {
+        let all_segments = vec![
+            TranscriptSegment {
+                text: "alpha beta".into(),
+                start: Duration::from_secs(0),
+                end: Duration::from_secs(2),
+            },
+            TranscriptSegment {
+                text: "gamma delta epsilon".into(),
+                start: Duration::from_secs(2),
+                end: Duration::from_secs(4),
+            },
+        ];
+        let chunk = AudioChunk {
+            path: std::path::PathBuf::from("chunk.opus"),
+            index: 1,
+            audio_start: Duration::from_secs(4),
+            start: Duration::from_secs(5),
+            end: Duration::from_secs(8),
+        };
+
+        let prompt = build_conditioning_prompt(&all_segments, &chunk, 14).unwrap();
+
+        assert_eq!(prompt, "delta epsilon");
     }
 
     #[test]
