@@ -425,10 +425,23 @@ fn clip_to_last_chars(text: &str, max_chars: usize) -> String {
         return text.trim().to_string();
     }
 
-    let clipped = text
-        .chars()
-        .skip(total_chars.saturating_sub(max_chars))
-        .collect::<String>();
+    let start_char = total_chars.saturating_sub(max_chars);
+    let start_byte = text
+        .char_indices()
+        .nth(start_char)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let clipped = &text[start_byte..];
+    let starts_on_word_boundary = start_byte == 0
+        || text[..start_byte]
+            .chars()
+            .last()
+            .is_some_and(char::is_whitespace);
+
+    if starts_on_word_boundary {
+        return clipped.trim().to_string();
+    }
+
     if let Some(boundary) = clipped.find(char::is_whitespace) {
         let trimmed = clipped[boundary..].trim();
         if !trimmed.is_empty() {
@@ -725,6 +738,20 @@ mod tests {
         let prompt = build_conditioning_prompt(&all_segments, &chunk, 14).unwrap();
 
         assert_eq!(prompt, "delta epsilon");
+    }
+
+    #[test]
+    fn test_clip_to_last_chars_keeps_boundary_aligned_prefix() {
+        let clipped = clip_to_last_chars("alpha beta gamma", 10);
+
+        assert_eq!(clipped, "beta gamma");
+    }
+
+    #[test]
+    fn test_clip_to_last_chars_drops_partial_word_prefix() {
+        let clipped = clip_to_last_chars("alpha beta gamma", 9);
+
+        assert_eq!(clipped, "gamma");
     }
 
     #[test]
