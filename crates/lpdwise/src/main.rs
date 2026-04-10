@@ -139,7 +139,11 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
 
     let duration_ms = asset.duration.map(|d| d.as_millis() as u64).unwrap_or(0);
     let size_bytes = asset.size_bytes.unwrap_or(0);
-    let groq_chunk_policy = lpdwise_audio::ChunkingPolicy::groq_whisper();
+    let groq_chunk_policy = if matches!(engine_kind, lpdwise_core::EngineKind::GroqWhisper) {
+        build_groq_chunk_policy(&cli)?
+    } else {
+        lpdwise_audio::ChunkingPolicy::groq_whisper()
+    };
     let cut_points = if matches!(engine_kind, lpdwise_core::EngineKind::GroqWhisper) {
         lpdwise_audio::adaptive_chunk_with_policy(
             &silences,
@@ -185,20 +189,31 @@ async fn run_pipeline(cli: Cli) -> Result<(), AppError> {
 
     // -- Transcribe --
     let transcribe_pb = progress::create_progress_bar(chunks.len() as u64, Stage::Transcribing);
-    let mut all_segments = Vec::new();
+    let transcript = match engine_kind {
+        lpdwise_core::EngineKind::GroqWhisper => {
+            let transcript = transcribe_groq_chunks(&chunks, &config, language, &cli)
+                .await
+                .context("Groq transcription failed")?;
+            transcribe_pb.inc(chunks.len() as u64);
+            transcript
+        }
+        lpdwise_core::EngineKind::SherpaOnnxSenseVoice
+        | lpdwise_core::EngineKind::SherpaOnnxWhisper => {
+            let mut all_segments = Vec::new();
+            for chunk in &chunks {
+                let segments = transcribe_chunk(engine_kind, chunk, &config)
+                    .await
+                    .with_context(|| format!("transcription failed for chunk {}", chunk.index))?;
+                lpdwise_asr::merge_chunk_segments(&mut all_segments, chunk, segments);
+                transcribe_pb.inc(1);
+            }
 
-    for chunk in &chunks {
-        let segments = transcribe_chunk(engine_kind, chunk, &config, language)
-            .await
-            .with_context(|| format!("transcription failed for chunk {}", chunk.index))?;
-        lpdwise_asr::merge_chunk_segments(&mut all_segments, chunk, segments);
-        transcribe_pb.inc(1);
-    }
-    finish_stage(&transcribe_pb, Stage::Transcribing);
-
-    let transcript = lpdwise_core::Transcript {
-        segments: all_segments,
+            lpdwise_core::Transcript {
+                segments: all_segments,
+            }
+        }
     };
+    finish_stage(&transcribe_pb, Stage::Transcribing);
 
     // -- Assemble prompt --
     let assemble_spinner = create_spinner(Stage::Assembling);
@@ -236,22 +251,8 @@ async fn transcribe_chunk(
     engine: lpdwise_core::EngineKind,
     chunk: &lpdwise_core::AudioChunk,
     config: &lpdwise_core::AppConfig,
-    language: lpdwise_core::Language,
 ) -> Result<Vec<lpdwise_core::TranscriptSegment>, AppError> {
     match engine {
-        lpdwise_core::EngineKind::GroqWhisper => {
-            let api_key = config.groq_api_key.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("Groq API key not configured — set GROQ_API_KEY or config file")
-            })?;
-            let transcript = lpdwise_asr::transcribe_chunks(
-                std::slice::from_ref(chunk),
-                api_key,
-                Some(language.bcp47_tag()),
-            )
-            .await
-            .context("Groq transcription failed")?;
-            Ok(transcript.segments)
-        }
         lpdwise_core::EngineKind::SherpaOnnxSenseVoice
         | lpdwise_core::EngineKind::SherpaOnnxWhisper => {
             let model_dir = config.models_dir.clone();
@@ -262,7 +263,57 @@ async fn transcribe_chunk(
                 .context("sherpa-onnx transcription failed")?;
             Ok(segments)
         }
+        lpdwise_core::EngineKind::GroqWhisper => Err(anyhow::anyhow!(
+            "Groq transcription should be handled through sequential chunk processing"
+        )),
     }
+}
+
+async fn transcribe_groq_chunks(
+    chunks: &[lpdwise_core::AudioChunk],
+    config: &lpdwise_core::AppConfig,
+    language: lpdwise_core::Language,
+    cli: &Cli,
+) -> Result<lpdwise_core::Transcript, AppError> {
+    let api_key = config.groq_api_key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("Groq API key not configured — set GROQ_API_KEY or config file")
+    })?;
+    let options = lpdwise_asr::GroqTranscriptionOptions::new(Some(language.bcp47_tag()))
+        .with_prompt_max_chars(cli.groq.prompt_chars);
+
+    lpdwise_asr::transcribe_chunks_with_options(chunks, api_key, options)
+        .await
+        .context("Groq sequential transcription failed")
+}
+
+fn build_groq_chunk_policy(cli: &Cli) -> Result<lpdwise_audio::ChunkingPolicy, AppError> {
+    if cli.groq.min_chunk_seconds == 0 {
+        return Err(anyhow::anyhow!(
+            "--min-chunk-seconds must be greater than 0"
+        ));
+    }
+    if cli.groq.min_chunk_seconds > cli.groq.target_chunk_seconds {
+        return Err(anyhow::anyhow!(
+            "--min-chunk-seconds must be <= --target-chunk-seconds"
+        ));
+    }
+    if cli.groq.target_chunk_seconds > cli.groq.max_chunk_seconds {
+        return Err(anyhow::anyhow!(
+            "--target-chunk-seconds must be <= --max-chunk-seconds"
+        ));
+    }
+    if cli.groq.overlap_seconds >= cli.groq.max_chunk_seconds {
+        return Err(anyhow::anyhow!(
+            "--overlap-seconds must be smaller than --max-chunk-seconds"
+        ));
+    }
+
+    let mut policy = lpdwise_audio::ChunkingPolicy::groq_whisper();
+    policy.max_chunk_duration_ms = cli.groq.max_chunk_seconds.saturating_mul(1000);
+    policy.target_chunk_duration_ms = cli.groq.target_chunk_seconds.saturating_mul(1000);
+    policy.min_chunk_duration_ms = cli.groq.min_chunk_seconds.saturating_mul(1000);
+    policy.overlap_ms = cli.groq.overlap_seconds.saturating_mul(1000);
+    Ok(policy)
 }
 
 /// Initialize tracing with env filter support.
@@ -275,4 +326,103 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        Cli::parse_from(args.iter().copied())
+    }
+
+    #[test]
+    fn test_build_groq_chunk_policy_maps_cli_values() {
+        let cli = parse_cli(&[
+            "lpdwise",
+            "--target-chunk-seconds",
+            "240",
+            "--max-chunk-seconds",
+            "480",
+            "--min-chunk-seconds",
+            "75",
+            "--overlap-seconds",
+            "12",
+            "https://example.com",
+        ]);
+
+        let policy = build_groq_chunk_policy(&cli).expect("valid Groq chunk policy");
+
+        assert_eq!(policy.target_chunk_duration_ms, 240_000);
+        assert_eq!(policy.max_chunk_duration_ms, 480_000);
+        assert_eq!(policy.min_chunk_duration_ms, 75_000);
+        assert_eq!(policy.overlap_ms, 12_000);
+    }
+
+    #[test]
+    fn test_build_groq_chunk_policy_rejects_zero_minimum() {
+        let cli = parse_cli(&["lpdwise", "--min-chunk-seconds", "0", "https://example.com"]);
+
+        let error = build_groq_chunk_policy(&cli).expect_err("zero minimum must fail");
+
+        assert!(error
+            .to_string()
+            .contains("--min-chunk-seconds must be greater than 0"));
+    }
+
+    #[test]
+    fn test_build_groq_chunk_policy_rejects_minimum_above_target() {
+        let cli = parse_cli(&[
+            "lpdwise",
+            "--target-chunk-seconds",
+            "120",
+            "--min-chunk-seconds",
+            "121",
+            "https://example.com",
+        ]);
+
+        let error = build_groq_chunk_policy(&cli).expect_err("minimum above target must fail");
+
+        assert!(error
+            .to_string()
+            .contains("--min-chunk-seconds must be <= --target-chunk-seconds"));
+    }
+
+    #[test]
+    fn test_build_groq_chunk_policy_rejects_target_above_maximum() {
+        let cli = parse_cli(&[
+            "lpdwise",
+            "--target-chunk-seconds",
+            "601",
+            "--max-chunk-seconds",
+            "600",
+            "https://example.com",
+        ]);
+
+        let error = build_groq_chunk_policy(&cli).expect_err("target above maximum must fail");
+
+        assert!(error
+            .to_string()
+            .contains("--target-chunk-seconds must be <= --max-chunk-seconds"));
+    }
+
+    #[test]
+    fn test_build_groq_chunk_policy_rejects_overlap_at_or_above_maximum() {
+        let cli = parse_cli(&[
+            "lpdwise",
+            "--target-chunk-seconds",
+            "120",
+            "--max-chunk-seconds",
+            "120",
+            "--overlap-seconds",
+            "120",
+            "https://example.com",
+        ]);
+
+        let error = build_groq_chunk_policy(&cli).expect_err("overlap at max must fail");
+
+        assert!(error
+            .to_string()
+            .contains("--overlap-seconds must be smaller than --max-chunk-seconds"));
+    }
 }

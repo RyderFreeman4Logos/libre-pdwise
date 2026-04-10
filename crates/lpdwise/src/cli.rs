@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// lpdwise — audio/video knowledge extraction CLI.
 #[derive(Parser, Debug)]
@@ -35,6 +35,9 @@ pub(crate) struct Cli {
     /// Custom directory for sherpa-onnx models.
     #[arg(long)]
     pub(crate) model_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub(crate) groq: GroqQualityArgs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -76,6 +79,30 @@ pub(crate) enum TemplateArg {
     Political,
     /// Full faithful translation to Chinese.
     Translation,
+}
+
+/// Groq-only tuning knobs for chunk quality and sequential conditioning.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct GroqQualityArgs {
+    /// Preferred Groq chunk length in seconds before silence-prioritized splitting.
+    #[arg(long, default_value_t = 300, help_heading = "Groq Quality")]
+    pub(crate) target_chunk_seconds: u64,
+
+    /// Hard Groq chunk ceiling in seconds.
+    #[arg(long, default_value_t = 600, help_heading = "Groq Quality")]
+    pub(crate) max_chunk_seconds: u64,
+
+    /// Minimum chunk length in seconds before considering an earlier silence.
+    #[arg(long, default_value_t = 90, help_heading = "Groq Quality")]
+    pub(crate) min_chunk_seconds: u64,
+
+    /// Backward overlap in seconds for Groq chunk extraction.
+    #[arg(long, default_value_t = 10, help_heading = "Groq Quality")]
+    pub(crate) overlap_seconds: u64,
+
+    /// Characters of prior transcript to send as Groq prompt conditioning. Set 0 to disable.
+    #[arg(long, default_value_t = 256, help_heading = "Groq Quality")]
+    pub(crate) prompt_chars: usize,
 }
 
 impl LanguageArg {
@@ -140,6 +167,11 @@ mod tests {
         assert!(!cli.non_interactive);
         assert!(!cli.no_archive);
         assert!(cli.model_dir.is_none());
+        assert_eq!(cli.groq.target_chunk_seconds, 300);
+        assert_eq!(cli.groq.max_chunk_seconds, 600);
+        assert_eq!(cli.groq.min_chunk_seconds, 90);
+        assert_eq!(cli.groq.overlap_seconds, 10);
+        assert_eq!(cli.groq.prompt_chars, 256);
     }
 
     #[test]
@@ -156,6 +188,16 @@ mod tests {
             "--no-archive",
             "--model-dir",
             "/tmp/models",
+            "--target-chunk-seconds",
+            "240",
+            "--max-chunk-seconds",
+            "480",
+            "--min-chunk-seconds",
+            "75",
+            "--overlap-seconds",
+            "12",
+            "--prompt-chars",
+            "128",
             "https://example.com",
         ]);
         assert!(matches!(cli.engine, EngineArg::Groq));
@@ -164,6 +206,11 @@ mod tests {
         assert!(cli.non_interactive);
         assert!(cli.no_archive);
         assert_eq!(cli.model_dir.unwrap(), PathBuf::from("/tmp/models"));
+        assert_eq!(cli.groq.target_chunk_seconds, 240);
+        assert_eq!(cli.groq.max_chunk_seconds, 480);
+        assert_eq!(cli.groq.min_chunk_seconds, 75);
+        assert_eq!(cli.groq.overlap_seconds, 12);
+        assert_eq!(cli.groq.prompt_chars, 128);
     }
 
     #[test]

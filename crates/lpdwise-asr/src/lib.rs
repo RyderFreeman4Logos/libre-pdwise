@@ -6,6 +6,9 @@ pub mod model;
 pub mod sherpa;
 
 pub use engine::{AsrEngine, AsrError};
-pub use groq::{merge_chunk_segments, transcribe_chunks, GroqWhisperEngine};
+pub use groq::{
+    merge_chunk_segments, transcribe_chunks, transcribe_chunks_with_options,
+    GroqTranscriptionOptions, GroqWhisperEngine,
+};
 pub use model::{download_model, ModelError};
 pub use sherpa::SherpaOnnxEngine;
